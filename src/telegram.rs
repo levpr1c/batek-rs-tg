@@ -1187,15 +1187,46 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                 ));
             }
             // "meme" и точное имя мема идут обычным поиском по подстроке.
-            // Совпавшие мемы без file_id догружаются фоном, сам ответ не
-            // ждёт: ожидание загрузки не укладывалось в окно inline-ответа.
+            // Сначала общая таблица триггеров с группами: алиасы работают
+            // здесь так же, как в чатах. Совпадение по таблице исключает
+            // обычный поиск по именам, чтобы не задваивать те же файлы.
             Some(InlineCommand::Meme) | None => {
-                let matched = data.memes.matches(&needle);
+                let matched: Vec<&Meme> =
+                    if let Some((phrase, action)) = keywords::match_keyword_prefix(&needle) {
+                        debug!(
+                            "Telegram: inline: '{}' по таблице '{}' ({phrase:?})",
+                            needle, phrase
+                        );
+                        match action {
+                            keywords::KeywordAction::Grandmobile => {
+                                results.push(article_result(
+                                    "keyword-grandmobile",
+                                    "Гранд мобайл",
+                                    "отправит текст",
+                                    misc::grandmobile_text().to_string(),
+                                ));
+                                Vec::new()
+                            }
+                            keywords::KeywordAction::Meme(meme_needle) => {
+                                data.memes.find(meme_needle).into_iter().collect()
+                            }
+                            keywords::KeywordAction::RandomMeme(random_needles) => {
+                                // Все кандидаты отдельными результатами: и
+                                // bomjara1, и bomjaro2, а не один случайный.
+                                // Каталог уже отсортирован по имени, порядок
+                                // выдачи детерминированный.
+                                keywords::random_meme_candidates(&data.memes, random_needles)
+                            }
+                        }
+                    } else {
+                        data.memes.matches(&needle)
+                    };
+
                 let (readiness, queued) = serve_matched_memes(
                     &data,
                     &matched,
                     &mut results,
-                    |_, len| format!("m{len}"),
+                    |_, len| format!("k{len}"),
                     &mut *data.inline_uploading.write().await,
                 )
                 .await;
@@ -1204,13 +1235,18 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                 match readiness {
                     MemeReadiness::Cached => {}
                     MemeReadiness::Preparing => results.insert(0, preparing_article()),
+                    // Оставшийся без результатов текстом случай: ключ не
+                    // совпал и по таблице, и по именам, либо совпавший
+                    // мем вообще не лежит в каталоге.
                     MemeReadiness::NoMatch => {
-                        results.push(article_result(
-                            "not-found",
-                            "Ничего не найдено",
-                            "список команд",
-                            command_list_text(),
-                        ));
+                        if results.is_empty() {
+                            results.push(article_result(
+                                "not-found",
+                                "Ничего не найдено",
+                                "список команд",
+                                command_list_text(),
+                            ));
+                        }
                     }
                 }
             }

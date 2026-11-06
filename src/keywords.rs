@@ -21,7 +21,7 @@ pub const KEYWORD_PRUNE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Ключевые слова для реакции в группах. Список расширяется здесь; каждая
 /// строка нормализуется тем же матчером, что и имена мемов, поэтому запрос
 /// не зависит от алфавита и написания.
-pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 27] = [
+pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 29] = [
     ("гранд мобайл", KeywordAction::Grandmobile),
     ("грандмобайл", KeywordAction::Grandmobile),
     ("grandmobile", KeywordAction::Grandmobile),
@@ -60,6 +60,10 @@ pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 27] = [
     ("марк", KeywordAction::Meme("makuos")),
     ("mark aderli", KeywordAction::Meme("makuos")),
     ("mark", KeywordAction::Meme("makuos")),
+    // Фамилия без имени: целым словом, а не подстрокой, поэтому
+    // перечислена явно.
+    ("аддерли", KeywordAction::Meme("makuos")),
+    ("adderli", KeywordAction::Meme("makuos")),
     // shefos.mp4: "320" это отдельное слово, а не подстрока; границу слова
     // и лимит в 20 секунд держит общий матчер.
     ("шефос", KeywordAction::Meme("shefos")),
@@ -100,6 +104,49 @@ pub fn match_keyword(text: &str) -> Option<(&'static str, KeywordAction)> {
             .windows(needle.len())
             .any(|window| window.concat() == whole)
     })
+}
+
+/// Запрос к той же таблице одной строкой: слова склеиваются, границы
+/// сознательно теряются, потому что inline-запрос приходит по мере набора.
+fn normalized_query(text: &str) -> String {
+    normalized_words(text).concat()
+}
+
+/// Свободный запрос inline к той же таблице, что и chat-реакции. Точный
+/// нормализованный матч сильнее префикса, поэтому совпадение по таблице
+/// исключает поиск по именам мемов. Префикс работает от двух символов:
+/// "ман" уже приводит к bomjara, пока пользователь допечатывает. Из равных
+/// длин побеждает первая запись таблицы, порядок стабилен.
+pub fn match_keyword_prefix(query: &str) -> Option<(&'static str, KeywordAction)> {
+    let needle = normalized_query(query);
+    if needle.is_empty() {
+        return None;
+    }
+
+    // Точный нормализованный матч важнее префикса: "грандмобайл" обязан
+    // прийти к одноимённой записи, а не через префикс.
+    if let Some(exact) = KEYWORD_REACTIONS
+        .iter()
+        .copied()
+        .find(|(phrase, _)| normalized_query(phrase) == needle)
+    {
+        return Some(exact);
+    }
+    if needle.chars().count() < 2 {
+        return None;
+    }
+
+    let mut best: Option<(usize, (&'static str, KeywordAction))> = None;
+    for entry in KEYWORD_REACTIONS.iter().copied() {
+        let normalized = normalized_query(entry.0);
+        if normalized.starts_with(&needle) {
+            let len = normalized.len();
+            if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
+                best = Some((len, entry));
+            }
+        }
+    }
+    best.map(|(_, entry)| entry)
 }
 
 /// Все мемы, чьё имя содержит любую из подстрок. Кандидаты нужны, чтобы
@@ -338,5 +385,51 @@ mod tests {
             shared("марк адерли").map(|(_, action)| action),
             Some(KeywordAction::Meme("makuos"))
         );
+    }
+
+    #[test]
+    fn inline_prefix_tables_cover_every_alias() {
+        let bomjara = KeywordAction::RandomMeme(&["bomjara", "bomjaro"]);
+        for (query, expected) in [
+            ("ман", bomjara),
+            ("манжара", bomjara),
+            ("manjaro", bomjara),
+            // Имя мема совпадает с алиасом: таблица одна на чат и inline.
+            ("bomjara", bomjara),
+            ("аддерли", KeywordAction::Meme("makuos")),
+            ("марк", KeywordAction::Meme("makuos")),
+            ("makuos", KeywordAction::Meme("makuos")),
+            ("пингвин320", KeywordAction::Meme("shefos")),
+            ("шефос", KeywordAction::Meme("shefos")),
+            ("белые", KeywordAction::Meme("Белые Розы")),
+            ("гранд", KeywordAction::Grandmobile),
+        ] {
+            assert_eq!(
+                match_keyword_prefix(query).map(|(_, action)| action),
+                Some(expected),
+                "{query}"
+            );
+        }
+
+        // Постороннее слово и слишком короткий ввод не совпадают.
+        assert_eq!(match_keyword_prefix("вполне посторонний вопрос"), None);
+        assert_eq!(match_keyword_prefix("в"), None);
+        assert_eq!(match_keyword_prefix(""), None);
+    }
+
+    #[test]
+    fn inline_prefix_agrees_with_chat_matcher_on_every_phrase() {
+        for (phrase, expected) in KEYWORD_REACTIONS {
+            assert_eq!(
+                match_keyword_prefix(phrase).map(|(_, action)| action),
+                Some(expected),
+                "inline и chat расходятся на {phrase}"
+            );
+            assert_eq!(
+                match_keyword(phrase).map(|(_, action)| action),
+                Some(expected),
+                "chat не видит собственную фразу {phrase}"
+            );
+        }
     }
 }
