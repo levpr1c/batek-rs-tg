@@ -10,10 +10,12 @@
 //!
 //! Inline-режим отдаёт только `cached`-результаты: Telegram не разрешает
 //! подставлять локальный файл в inline-ответ, нужен file_id после первой
-//! отправки. Кэш заполняется каждым успешным `/meme`; `TG_CACHE_CHAT`
-//! прогревает его на старте.
+//! отправки. Ответ строится только из кэша и отдаётся сразу; совпавшие,
+//! но ещё не загруженные мемы уходят в фоновую загрузку и попадают в
+//! выдачу следующего запроса. Кэш заполняется каждым успешным `/meme`;
+//! `TG_CACHE_CHAT` прогревает его на старте.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -58,6 +60,9 @@ pub struct TgData {
     /// file_id по имени мема. Заполняется только успешными отправками:
     /// угадать file_id нельзя, его выдаёт Telegram.
     pub file_ids: Arc<RwLock<HashMap<String, String>>>,
+    /// Бронь на фоновую inline-догрузку по имени мема: повторный запрос
+    /// не запускает вторую загрузку того же файла.
+    pub inline_uploading: Arc<RwLock<HashSet<String>>>,
     /// Лимиты ключевых слов этого процесса: не чаще одного ответа на фразу
     /// в чат за KEYWORD_RATE_LIMIT.
     pub keywords: Arc<keywords::KeywordLimiter>,
@@ -79,6 +84,7 @@ impl TgData {
             memes,
             root,
             file_ids: Arc::new(RwLock::new(HashMap::new())),
+            inline_uploading: Arc::new(RwLock::new(HashSet::new())),
             keywords: Arc::new(keywords::KeywordLimiter::new()),
             warm_done: Arc::new(AtomicBool::new(false)),
         }
@@ -869,14 +875,15 @@ async fn random_youtube_id(data: &TgData, suffix: &str) -> Option<String> {
     random_youtube_ids(data, &INLINE_CHANNELS, suffix).await
 }
 
-/// Сколько файлов разрешено догрузить за один inline-запрос: больше трёх
-/// упирается в лимиты Telegram и задерживает ответ.
+/// Сколько файлов разрешено запустить фоном за один inline-запрос: больше
+/// трёх упирается в лимиты Telegram и не нужна задержка ответа.
 const INLINE_LAZY_UPLOADS: usize = 3;
 
-/// Догружает мем в личный чат спрашивающего, запоминает выданный file_id и
-/// сразу удаляет сообщение, чтобы не засорять переписку. Возвращает file_id
-/// только при полном успехе: иначе результат в выдачу не попадает.
-async fn upload_for_inline(bot: &Bot, user: ChatId, meme: &Meme, data: &TgData) -> Option<String> {
+/// Догружает мем в личный чат, запоминает выданный file_id и удаляет
+/// сообщение, чтобы не засорять переписку. Вызывается только из фоновых
+/// задач: await здесь не имеет права задерживать ответ на inline-запрос.
+/// Возвращает file_id только при полном успехе.
+async fn upload_for_inline(bot: &Bot, user: ChatId, meme: Meme, data: &TgData) -> Option<String> {
     // Проверка до отправки: send_meme на ошибке пишет сообщение в чат, а в
     // личном чате это был бы мусор от неудачного прогрева.
     match tokio::fs::metadata(&meme.path).await {
@@ -924,52 +931,108 @@ async fn upload_for_inline(bot: &Bot, user: ChatId, meme: &Meme, data: &TgData) 
     file_id
 }
 
-/// file_id из кэша или ленивая загрузка, пока не исчерпан бюджет запроса.
-async fn inline_file_id(
-    bot: &Bot,
-    user: ChatId,
-    data: &TgData,
-    meme: &Meme,
-    warm_budget: &mut usize,
-) -> Option<String> {
-    if let Some(file_id) = data.file_ids.read().await.get(&meme.name) {
-        return Some(file_id.clone());
-    }
-    if *warm_budget == 0 {
-        return None;
-    }
-    *warm_budget -= 1;
-    upload_for_inline(bot, user, meme, data).await
+/// Готовность ответа по совпавшим мемам.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemeReadiness {
+    /// Хотя бы один file_id взят из кэша: есть что показывать сразу.
+    Cached,
+    /// Мемы нашлись, но кэш пуст. Фоновая загрузка запланирована, повторный
+    /// запрос через секунду увидит результат.
+    Preparing,
+    /// Совпадений нет.
+    NoMatch,
 }
 
-/// Добавляет cached-результаты для мемов, чьё имя содержит любую из подстрок.
-/// Используется командами с готовыми файлами: порядок задаёт таблица, а не
-/// порядок каталога.
-async fn push_media_memes(
-    results: &mut Vec<InlineQueryResult>,
-    bot: &Bot,
-    user: ChatId,
+/// Готовит выдачу по совпавшим мемам, не выходя за пределы кэша: ждёт
+/// только чтение file_ids, загрузок здесь нет. Совпавшие мемы без file_id
+/// возвращаются списком на фоновую догрузку, ограниченным бюджетом запроса.
+async fn serve_matched_memes<F>(
     data: &TgData,
-    needles: &[&str],
-    warm_budget: &mut usize,
-) {
-    for needle in needles {
-        if results.len() >= INLINE_RESULT_LIMIT {
+    matched: &[&Meme],
+    results: &mut Vec<InlineQueryResult>,
+    mut result_id: F,
+    in_flight: &mut HashSet<String>,
+) -> (MemeReadiness, Vec<Meme>)
+where
+    F: FnMut(&Meme, usize) -> String,
+{
+    let cache = data.file_ids.read().await;
+    let mut readiness = MemeReadiness::NoMatch;
+    let mut pending: Vec<Meme> = Vec::new();
+
+    for &meme in matched {
+        match cache.get(&meme.name) {
+            Some(file_id) => {
+                if results.len() >= INLINE_RESULT_LIMIT {
+                    break;
+                }
+                readiness = MemeReadiness::Cached;
+                let id = result_id(meme, results.len());
+                results.push(cached_meme_result(id, meme, file_id));
+            }
+            None => {
+                if readiness == MemeReadiness::NoMatch {
+                    readiness = MemeReadiness::Preparing;
+                }
+                if pending.len() < INLINE_LAZY_UPLOADS {
+                    pending.push(meme.clone());
+                }
+            }
+        }
+    }
+    drop(cache);
+
+    (readiness, queue_pending_uploads(pending, in_flight))
+}
+
+/// Отбирает мемы на фоновую догрузку: бюджет на запрос и бронь против
+/// дубликатов. Чистая книга учёта без сети, чтобы повторный запрос не
+/// запускал вторую загрузку того же файла.
+fn queue_pending_uploads(pending: Vec<Meme>, in_flight: &mut HashSet<String>) -> Vec<Meme> {
+    let mut queued = Vec::new();
+    for meme in pending {
+        if queued.len() >= INLINE_LAZY_UPLOADS {
             break;
         }
-        let Some(meme) = data.memes.find(needle) else {
-            continue;
-        };
-        // Точный ключ, а не опечатка: иначе `bomjaro2` при отсутствии файла
-        // подтянул бы `bomjara1` вторым результатом с тем же id.
-        if meme_key(&meme.name) != meme_key(needle) {
-            continue;
+        // insert возвращает false, если имя уже в работе: такой мем
+        // пропускается без списания бюджета.
+        if in_flight.insert(meme.name.clone()) {
+            queued.push(meme);
         }
-        let Some(file_id) = inline_file_id(bot, user, data, meme, warm_budget).await else {
-            continue;
-        };
-        results.push(cached_meme_result(meme.name.clone(), meme, &file_id));
     }
+    queued
+}
+
+/// Запускает фоновую догрузку уже отобранных мемов. Вызывается после
+/// ответа: await внутри не влияет на срок ответа inline-запроса.
+fn spawn_inline_uploads(bot: &Bot, user: ChatId, queued: Vec<Meme>, data: &TgData) {
+    for meme in queued {
+        let bot = bot.clone();
+        let data = data.clone();
+        tokio::spawn(async move {
+            let name = meme.name.clone();
+            // Кэш могли прогреть между бронью и запуском задачи.
+            if data.file_ids.read().await.contains_key(&name) {
+                data.inline_uploading.write().await.remove(&name);
+                return;
+            }
+            upload_for_inline(&bot, user, meme, &data).await;
+            // Бронь снимается после попытки: удачная загрузка дальше читается
+            // из кэша, неудачная позволяет следующему запросу повторить.
+            data.inline_uploading.write().await.remove(&name);
+        });
+    }
+}
+
+/// Подсказка, когда мемы совпали, но кэш пуст: загрузка запущена, файл
+/// появится в выдаче следующего запроса, не этого.
+fn preparing_article() -> InlineQueryResult {
+    article_result(
+        "preparing",
+        "Мем загружается",
+        "файл появится через секунду",
+        "Мем нашёлся, но ещё не в кэше. Загрузка идёт в фоне, повторите запрос через секунду.",
+    )
 }
 
 async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
@@ -1035,26 +1098,50 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
             added += 1;
         }
     } else {
-        // Личный чат автора запроса: туда временно уходит файл, чтобы
-        // получить file_id, и оттуда же удаляется сообщение.
+        // Личный чат автора запроса: туда фоном уходит файл, чтобы получить
+        // file_id, и оттуда же удаляется сообщение. Сам ответ строится
+        // только из кэша: загрузка лежит вне окна inline-ответа, ожидание
+        // в этом обработчике давало "query is too old".
         let user = ChatId(query.from.id.0 as i64);
-        let mut warm_budget = INLINE_LAZY_UPLOADS;
 
         match inline_command(&needle) {
-            // Команда с готовыми файлами: отдаём сами файлы, а недостающие
-            // file_id догружаем в личный чат. Если не вышло ни одного,
-            // подсказка объясняет, как получить кэш, вместо мёртвой команды
-            // текстом.
+            // Команда с готовыми файлами: отдаём сами файлы из кэша, а
+            // недостающие file_id догружаются фоном. Если кэш пуст, но мем
+            // нашёлся, подсказка просит повторить запрос; если мема нет
+            // вообще, ответ прежний, текстом.
             Some(InlineCommand::Media(needles)) => {
-                push_media_memes(&mut results, &bot, user, &data, needles, &mut warm_budget).await;
-                if results.is_empty() {
-                    results.push(article_result(
-                        "media-cold",
-                        "Мем ещё не в кэше",
-                        "появится после /meme или прогрева",
-                        "Этот мем появится в inline после первой отправки /meme <имя> \
-                         в этом чате или после прогрева TG_CACHE_CHAT.",
-                    ));
+                // Точный ключ, а не опечатка: иначе `bomjaro2` при отсутствии
+                // файла подтянул бы `bomjara1` вторым результатом с тем же id.
+                let matched = needles
+                    .iter()
+                    .filter_map(|needle| data.memes.find(needle))
+                    .filter(|meme| {
+                        needles
+                            .iter()
+                            .any(|needle| meme_key(&meme.name) == meme_key(needle))
+                    })
+                    .collect::<Vec<_>>();
+                let (readiness, queued) = serve_matched_memes(
+                    &data,
+                    &matched,
+                    &mut results,
+                    |meme, _| meme.name.clone(),
+                    &mut *data.inline_uploading.write().await,
+                )
+                .await;
+                spawn_inline_uploads(&bot, user, queued, &data);
+                match readiness {
+                    MemeReadiness::Cached => {}
+                    MemeReadiness::Preparing => results.push(preparing_article()),
+                    MemeReadiness::NoMatch => {
+                        results.push(article_result(
+                            "media-cold",
+                            "Мем ещё не в кэше",
+                            "появится после /meme или прогрева",
+                            "Этот мем появится в inline после первой отправки /meme <имя> \
+                             в этом чате или после прогрева TG_CACHE_CHAT.",
+                        ));
+                    }
                 }
             }
             // Два действия для канала: шортс и обычное видео.
@@ -1100,32 +1187,31 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                 ));
             }
             // "meme" и точное имя мема идут обычным поиском по подстроке.
-            // Совпавшие мемы без file_id прогреваются лениво, пока есть
-            // бюджет запроса.
+            // Совпавшие мемы без file_id догружаются фоном, сам ответ не
+            // ждёт: ожидание загрузки не укладывалось в окно inline-ответа.
             Some(InlineCommand::Meme) | None => {
-                for meme in data.memes.matches(&needle) {
-                    if results.len() >= INLINE_RESULT_LIMIT {
-                        break;
-                    }
-                    let Some(file_id) =
-                        inline_file_id(&bot, user, &data, meme, &mut warm_budget).await
-                    else {
-                        continue;
-                    };
-                    results.push(cached_meme_result(
-                        format!("m{}", results.len()),
-                        meme,
-                        &file_id,
-                    ));
-                }
+                let matched = data.memes.matches(&needle);
+                let (readiness, queued) = serve_matched_memes(
+                    &data,
+                    &matched,
+                    &mut results,
+                    |_, len| format!("m{len}"),
+                    &mut *data.inline_uploading.write().await,
+                )
+                .await;
+                spawn_inline_uploads(&bot, user, queued, &data);
 
-                if results.is_empty() {
-                    results.push(article_result(
-                        "not-found",
-                        "Ничего не найдено",
-                        "список команд",
-                        command_list_text(),
-                    ));
+                match readiness {
+                    MemeReadiness::Cached => {}
+                    MemeReadiness::Preparing => results.insert(0, preparing_article()),
+                    MemeReadiness::NoMatch => {
+                        results.push(article_result(
+                            "not-found",
+                            "Ничего не найдено",
+                            "список команд",
+                            command_list_text(),
+                        ));
+                    }
                 }
             }
         }
@@ -1312,5 +1398,71 @@ mod tests {
 
         // Пустая фраза не должна совпадать со всем подряд.
         assert!(!contains_keyword("что угодно", ""));
+    }
+
+    fn inline_meme(name: &str) -> Meme {
+        Meme {
+            name: name.to_string(),
+            path: PathBuf::from(format!("video/{name}.mp4")),
+            kind: MemeKind::Video,
+        }
+    }
+
+    #[test]
+    fn inline_upload_guard_blocks_duplicate_and_allows_other() {
+        let mut in_flight = HashSet::new();
+
+        let queued = queue_pending_uploads(
+            vec![inline_meme("bomjara1"), inline_meme("makuos")],
+            &mut in_flight,
+        );
+        assert_eq!(
+            queued.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["bomjara1", "makuos"]
+        );
+        assert_eq!(
+            in_flight,
+            HashSet::from(["bomjara1".to_string(), "makuos".to_string()])
+        );
+
+        // Повторный запрос того же мема не ставит вторую загрузку в очередь.
+        let repeat = queue_pending_uploads(vec![inline_meme("bomjara1")], &mut in_flight);
+        assert!(
+            repeat.is_empty(),
+            "дубль загрузки по тому же мему: {repeat:?}"
+        );
+
+        // Другой мем бронируется как обычно.
+        let other = queue_pending_uploads(vec![inline_meme("shefos")], &mut in_flight);
+        assert_eq!(
+            other.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["shefos"]
+        );
+    }
+
+    #[test]
+    fn inline_upload_guard_caps_budget_per_query() {
+        let mut in_flight = HashSet::new();
+        let memes = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| inline_meme(n))
+            .collect();
+        let queued = queue_pending_uploads(memes, &mut in_flight);
+
+        assert_eq!(queued.len(), INLINE_LAZY_UPLOADS);
+        assert_eq!(in_flight.len(), INLINE_LAZY_UPLOADS);
+    }
+
+    #[test]
+    fn inline_upload_guard_released_after_attempt_allows_retry() {
+        let mut in_flight = HashSet::new();
+        let queued = queue_pending_uploads(vec![inline_meme("bomjara1")], &mut in_flight);
+        assert_eq!(queued.len(), 1);
+
+        // Фоновая задача снимает бронь той же операцией remove после
+        // попытки; после снятия тот же мем снова бронируется.
+        in_flight.remove("bomjara1");
+        let retry = queue_pending_uploads(vec![inline_meme("bomjara1")], &mut in_flight);
+        assert_eq!(retry.len(), 1);
     }
 }

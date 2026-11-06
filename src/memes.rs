@@ -32,6 +32,9 @@ impl MemeKind {
     }
 }
 
+/// `Clone`: фоновая inline-догрузка забирает себе владение копией мема.
+/// `Debug`: вывод в assert о книге учёта загрузок.
+#[derive(Clone, Debug)]
 pub struct Meme {
     pub name: String,
     pub path: PathBuf,
