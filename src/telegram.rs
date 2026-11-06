@@ -76,6 +76,24 @@ pub struct TgData {
     /// Прогрев выполняется один раз за процесс, а не на каждый перезапуск
     /// диспетчера после сетевой ошибки.
     warm_done: Arc<AtomicBool>,
+    /// /triggers открыт только для этого пользователя. `None` означает
+    /// выключенную отладку: переменная не задана или не число.
+    pub debug_user_id: Option<i64>,
+}
+
+/// Читает TG_DEBUG_USER_ID один раз при старте. Не задано или мусор это
+/// выключенная отладка: /triggers никому не отвечает рабочим содержимым.
+fn read_debug_user_id() -> Option<i64> {
+    let Ok(raw) = std::env::var("TG_DEBUG_USER_ID") else {
+        return None;
+    };
+    match raw.trim().parse::<i64>() {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!("Telegram: TG_DEBUG_USER_ID не число ({e}), отладка выключена");
+            None
+        }
+    }
 }
 
 impl TgData {
@@ -94,6 +112,7 @@ impl TgData {
             inline_uploading: Arc::new(RwLock::new(HashSet::new())),
             keywords: Arc::new(keywords::KeywordLimiter::new()),
             warm_done: Arc::new(AtomicBool::new(false)),
+            debug_user_id: read_debug_user_id(),
         }
     }
 }
@@ -173,6 +192,8 @@ fn telegram_commands() -> Vec<BotCommand> {
         BotCommand::new("timur", "ЗАЧЕМ Я ПОМЕНЯЛ ЕЕ НА ЭТО НА ЧЕРНОБЕЛОЕ"),
         BotCommand::new("victorovich", "В СТАРОМ ПАРКЕ ПАХНЕТ ХВОЙНОЙ ТИШИНОЙ"),
         BotCommand::new("meme", "случайный мем из video/, fotos/ или music/"),
+        // /triggers здесь нет: отладочная команда, скрыта от списка,
+        // работает только для пользователя из TG_DEBUG_USER_ID.
         BotCommand::new("batekfetch", "ЭЭЭФЕТЧИ"),
         BotCommand::new("bomjara", "АКАКФИЛЬМНАНОУТБУКЕВКЛЮЧИТЬ"),
         BotCommand::new(
@@ -213,7 +234,7 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
     info!("Telegram: прогрев file_id в чате {id}, мемов: {total}");
 
     for (index, meme) in items.iter().take(WARM_LIMIT).enumerate() {
-        match send_meme(bot, chat, meme, data, None).await {
+        match send_meme(bot, chat, meme, data, None, None).await {
             Ok(()) => info!("Telegram: прогрев {}/{}: {}", index + 1, total, meme.name),
             Err(e) => warn!(
                 "Telegram: прогрев {}/{}: {} не отправлен: {e}",
@@ -426,6 +447,23 @@ async fn handle_command(
         "timur" => video_choice(bot, msg, "t").await?,
         "victorovich" => video_choice(bot, msg, "v").await?,
         "meme" => meme_command(bot, chat, data, args).await?,
+        "triggers" | "words" => {
+            let sender = msg.from.as_ref().map(|user| user.id.0 as i64);
+            if !triggers_allowed(data.debug_user_id, sender) {
+                // Чужой молчит, чтобы не спамить в группе; отключённая
+                // отладка честно отвечает одной строкой.
+                if data.debug_user_id.is_none() {
+                    bot.send_message(chat, "Отладка выключена: TG_DEBUG_USER_ID не задан.")
+                        .await?;
+                }
+                debug!(
+                    "Telegram: /triggers отклонён: sender {sender:?}, debug_user_id {:?}",
+                    data.debug_user_id
+                );
+                return Ok(());
+            }
+            triggers_command(bot, chat, data, args).await?;
+        }
         "batekfetch" => {
             let info = tokio::task::spawn_blocking(misc::fetch_info).await?;
             bot.send_message(chat, misc::format_fetch(&info)).await?;
@@ -594,6 +632,74 @@ async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgR
     Ok(())
 }
 
+/// Пауза между файлами /triggers: без неё пачка фото упирается в лимит
+/// отправок в группу за несколько секунд.
+const TRIGGERS_GAP: Duration = Duration::from_millis(700);
+
+/// Разрешение на /triggers. Команда отладочная: только отправитель с
+/// id из TG_DEBUG_USER_ID. Прочие комбинации это отказ, в том числе
+/// unset отладки или анонимный отправитель. Чистая функция без сети,
+/// проверяется тестом.
+fn triggers_allowed(debug_user_id: Option<i64>, sender: Option<i64>) -> bool {
+    match (debug_user_id, sender) {
+        (Some(debug_id), Some(sender_id)) => debug_id == sender_id,
+        _ => false,
+    }
+}
+
+/// Мемы с хотя бы одной фразой в таблице триггеров. По умолчанию только
+/// фото: видео и аудио аудио длиннее, и пачка не должна раздуваться без
+/// явного запроса. Чистая функция без сети, проверяется тестом.
+fn trigger_list(memes: &Memes, all: bool) -> Vec<&Meme> {
+    memes
+        .items()
+        .iter()
+        .filter(|meme| {
+            (all || meme.kind == MemeKind::Image) && !keywords::phrases_for_meme(meme).is_empty()
+        })
+        .collect()
+}
+
+/// /triggers: показывает каждый мем с caption «слова: ...», чтобы группа
+/// видела, какое слово вызывает какой файл. Аргумент `все`/`all` раскрывает
+/// видео и аудио вместо только фото.
+async fn triggers_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgResult {
+    let all = matches!(args.trim().to_ascii_lowercase().as_str(), "все" | "all");
+    let list = trigger_list(&data.memes, all);
+
+    let header = if all {
+        "Триггеры всех мемов:"
+    } else {
+        "Триггеры фото:"
+    };
+
+    // Ни одного мема со словами: честнее сказать об этом одним сообщением
+    // словами, чем посылать заголовок без содержимого.
+    if list.is_empty() {
+        bot.send_message(chat, "Ни у одного мема нет слов-триггеров.")
+            .await?;
+        return Ok(());
+    }
+
+    bot.send_message(chat, header).await?;
+
+    for meme in list {
+        let phrases = keywords::phrases_for_meme(meme).join(", ");
+        let caption = format!("{}\nслова: {}", meme.name, phrases);
+        // Пропавший файл не должен прерывать пачку: лог и следующая итерация.
+        if tokio::fs::metadata(&meme.path).await.is_err() {
+            warn!("Telegram: /triggers: файл мема '{}' не найден", meme.name);
+            continue;
+        }
+        if let Err(e) = send_meme(bot, chat, meme, data, None, Some(caption)).await {
+            warn!("Telegram: /triggers: мем {} не отправлен: {e}", meme.name);
+        }
+        tokio::time::sleep(TRIGGERS_GAP).await;
+    }
+
+    Ok(())
+}
+
 /// Текст без имени: в группах бот должен понимать `@bot мем` и `мем @bot`.
 async fn handle_mention(
     bot: &Bot,
@@ -630,7 +736,7 @@ async fn send_meme_logged(
     data: &TgData,
     reply_to: Option<MessageId>,
 ) {
-    if let Err(e) = send_meme(bot, chat, meme, data, reply_to).await {
+    if let Err(e) = send_meme(bot, chat, meme, data, reply_to, None).await {
         error!("Telegram: мем {} не отправлен: {e}", meme.name);
         let _ = bot.send_message(chat, "❌ Не удалось отправить мем.").await;
     }
@@ -642,6 +748,7 @@ async fn send_meme(
     meme: &Meme,
     data: &TgData,
     reply_to: Option<MessageId>,
+    caption: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metadata = match tokio::fs::metadata(&meme.path).await {
         Ok(metadata) => metadata,
@@ -659,27 +766,40 @@ async fn send_meme(
     }
 
     let file = InputFile::file(&meme.path);
-    // Ответ на сообщение с ключевым словом: у Telegram это reply_parameters,
-    // у команд и инлайна ответа на конкретное сообщение нет.
-    let message = match (meme.kind, reply_to) {
-        (MemeKind::Video, Some(id)) => {
-            bot.send_video(chat, file)
-                .reply_parameters(ReplyParameters::new(id))
-                .await?
+    // Капция нужна /triggers: мем уходит с перечнем своих слов. Без
+    // капции отправка неотличима от прежней; ответ на сообщение при
+    // ключевой реакции держит reply_parameters.
+    let message = match meme.kind {
+        MemeKind::Video => {
+            let sent = match caption {
+                Some(text) => bot.send_video(chat, file).caption(text),
+                None => bot.send_video(chat, file),
+            };
+            match reply_to {
+                Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
+                None => sent.await?,
+            }
         }
-        (MemeKind::Video, None) => bot.send_video(chat, file).await?,
-        (MemeKind::Image, Some(id)) => {
-            bot.send_photo(chat, file)
-                .reply_parameters(ReplyParameters::new(id))
-                .await?
+        MemeKind::Image => {
+            let sent = match caption {
+                Some(text) => bot.send_photo(chat, file).caption(text),
+                None => bot.send_photo(chat, file),
+            };
+            match reply_to {
+                Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
+                None => sent.await?,
+            }
         }
-        (MemeKind::Image, None) => bot.send_photo(chat, file).await?,
-        (MemeKind::Audio, Some(id)) => {
-            bot.send_audio(chat, file)
-                .reply_parameters(ReplyParameters::new(id))
-                .await?
+        MemeKind::Audio => {
+            let sent = match caption {
+                Some(text) => bot.send_audio(chat, file).caption(text),
+                None => bot.send_audio(chat, file),
+            };
+            match reply_to {
+                Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
+                None => sent.await?,
+            }
         }
-        (MemeKind::Audio, None) => bot.send_audio(chat, file).await?,
     };
 
     if let Some(file_id) = message_file_id(&message) {
@@ -1347,6 +1467,11 @@ mod tests {
         let text = command_list_text();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 11, "ожидалось 11 команд, получено:\n{text}");
+        // /triggers отладочная и в списке объявлена быть не должна.
+        assert!(
+            !text.contains("/triggers"),
+            "триггеры просочились в меню:\n{text}"
+        );
 
         for command in [
             "start",
@@ -1476,6 +1601,50 @@ mod tests {
 
         // Пустая фраза не должна совпадать со всем подряд.
         assert!(!contains_keyword("что угодно", ""));
+    }
+
+    #[test]
+    fn trigger_list_prefers_images_and_skips_untriggered() {
+        let dir = std::env::temp_dir().join(format!("batek-triggers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("video")).unwrap();
+        std::fs::create_dir_all(dir.join("fotos")).unwrap();
+        std::fs::write(dir.join("fotos/Zadumka.png"), b"p").unwrap();
+        std::fs::write(dir.join("video/Без слов.mp4"), b"v").unwrap();
+
+        let memes = Memes::scan(&dir);
+
+        // По умолчанию только фото, и только со словами в таблице.
+        let photos = trigger_list(&memes, false);
+        assert_eq!(
+            photos.len(),
+            1,
+            "{:?}",
+            photos.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(photos[0].name, "Zadumka");
+        assert_eq!(photos[0].kind, MemeKind::Image);
+
+        // Режим `все` не тянет мемы без триггеров: видео без фраз остаётся
+        // за бортом, чтобы пачка не несла пустых сообщений.
+        let with_all = trigger_list(&memes, true);
+        assert_eq!(with_all.len(), 1);
+        assert_eq!(with_all[0].name, "Zadumka");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn triggers_command_is_restricted_to_debug_user() {
+        // Отладчик задан: проходит ровно его id.
+        assert!(triggers_allowed(Some(42), Some(42)));
+        assert!(!triggers_allowed(Some(42), Some(43)));
+        assert!(!triggers_allowed(Some(42), None), "аноним не проходит");
+
+        // Отладчик не задан или прочитан мусором: никто не проходит,
+        // и обработчик в этом случае отвечает, что отладка выключена.
+        assert!(!triggers_allowed(None, Some(42)));
+        assert!(!triggers_allowed(None, None));
     }
 
     fn inline_meme(name: &str) -> Meme {

@@ -295,6 +295,37 @@ pub fn match_keyword_prefix(query: &str) -> Option<(&'static str, KeywordAction)
     best.map(|(_, entry)| entry)
 }
 
+/// Совпадение иглы с мемом по нормализованным строкам в обе стороны:
+/// точный ключ или подстрока в любом направлении. «Серёжа» таблица
+/// держит одной иглой `serj`, и она обязана накрыть все его фото.
+fn needle_covers_name(name_key: &str, needle: &str) -> bool {
+    let needle_key = meme_key(needle);
+    !(name_key.is_empty() || needle_key.is_empty())
+        && (name_key.contains(needle_key.as_str()) || needle_key.contains(name_key))
+}
+
+/// Фразы таблицы, чей ключевой элемент указывает на этот мем. Meme(needle)
+/// сравнивается с именем напрямую, RandomMeme — любой его иглой. Порядок
+/// таблицы сохраняется, повторы отбрасываются. Это слова для caption
+/// в /triggers: группам видно, какое слово вызывает какое фото.
+pub fn phrases_for_meme(meme: &Meme) -> Vec<&'static str> {
+    let name_key = meme_key(&meme.name);
+    let mut phrases: Vec<&'static str> = Vec::new();
+    for (phrase, action) in KEYWORD_REACTIONS.iter().copied() {
+        let hit = match action {
+            KeywordAction::Grandmobile => false,
+            KeywordAction::Meme(needle) => needle_covers_name(&name_key, needle),
+            KeywordAction::RandomMeme(needles) => needles
+                .iter()
+                .any(|needle| needle_covers_name(&name_key, needle)),
+        };
+        if hit && !phrases.contains(&phrase) {
+            phrases.push(phrase);
+        }
+    }
+    phrases
+}
+
 /// Все мемы, чьё имя содержит любую из подстрок. Кандидаты нужны, чтобы
 /// `бомжара` выбирала между bomjara1 и bomjaro2, как `/bomjara`.
 pub fn random_meme_candidates<'a>(memes: &'a Memes, needles: &[&str]) -> Vec<&'a Meme> {
@@ -753,5 +784,48 @@ mod tests {
                 "inline и chat расходятся на {phrase}"
             );
         }
+    }
+
+    fn plain_meme(name: &str) -> Meme {
+        Meme {
+            name: name.to_string(),
+            path: PathBuf::from(format!("video/{name}.mp4")),
+            kind: MemeKind::Video,
+        }
+    }
+
+    #[test]
+    fn phrases_for_meme_lists_table_hits() {
+        let bomjara1 = phrases_for_meme(&plain_meme("bomjara1"));
+        assert!(
+            bomjara1.contains(&"бомжара"),
+            "случайная группа обязана попасть в caption: {bomjara1:?}"
+        );
+        assert!(
+            bomjara1.contains(&"манжара"),
+            "алиасы группы тоже слова этого мема: {bomjara1:?}"
+        );
+        assert!(
+            !bomjara1.contains(&"дедлок"),
+            "чужие группы не приписываются: {bomjara1:?}"
+        );
+
+        let makuos = phrases_for_meme(&plain_meme("makuos"));
+        assert!(
+            makuos.contains(&"марк адерли"),
+            "чистое Meme-действие с иглой makuos: {makuos:?}"
+        );
+        assert!(makuos.contains(&"makuos"), "{makuos:?}");
+        assert!(
+            !makuos.contains(&"база"),
+            "нейтральные фразы чужие: {makuos:?}"
+        );
+
+        let zadumka = phrases_for_meme(&plain_meme("Zadumka"));
+        assert!(zadumka.contains(&"дедлок"), "{zadumka:?}");
+        assert!(zadumka.contains(&"задумка"), "{zadumka:?}");
+
+        let loner = phrases_for_meme(&plain_meme("Григорий Лепс - Натали"));
+        assert!(loner.is_empty(), "нет алиасов, значит и пусто: {loner:?}");
     }
 }
