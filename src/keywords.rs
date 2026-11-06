@@ -35,7 +35,7 @@ const SERJ: &[&str] = &[
 /// не зависит от алфавита и написания. Правило группы: у каждого действия
 /// есть фраза и кириллицей, и ASCII (транслит или латиница), иначе тест
 /// every_action_has_cyrillic_and_ascii_phrase падает.
-pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 136] = [
+pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 142] = [
     ("гранд мобайл", KeywordAction::Grandmobile),
     ("грандмобайл", KeywordAction::Grandmobile),
     ("grandmobile", KeywordAction::Grandmobile),
@@ -202,6 +202,12 @@ pub const KEYWORD_REACTIONS: [(&str, KeywordAction); 136] = [
     ("смотрит", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
     ("watching", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
     ("where", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("neko", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("неко", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("nekomoki", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("некомоки", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("олег", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
+    ("oleg", KeywordAction::Meme("WHERE_HE_IS_WATHCING")),
     // хуюнай.
     ("хуюнай", KeywordAction::Meme("xyunai")),
     ("xyunai", KeywordAction::Meme("xyunai")),
