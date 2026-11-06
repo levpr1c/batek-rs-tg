@@ -1,10 +1,11 @@
-//! Мемы из уже существующих каталогов `video/` и `music/`.
+//! Мемы из уже существующих каталогов `video/`, `fotos/` и `music/`.
 //!
 //! Отдельного каталога нет: имя мема это stem файла, поэтому
-//! `video/bomjara1.mp4` и `music/Тёмный принц - Овердоз.mp3` доступны как
-//! `bomjara1` и `Тёмный принц - Овердоз`. Один и тот же stem в двух каталогах
-//! даёт один мем: видео важнее аудио, в остальных случаях побеждает первый
-//! найденный файл. Список читается один раз при старте: файлы меняются только
+//! `video/bomjara1.mp4`, `music/Тёмный принц - Овердоз.mp3` и
+//! `fotos/Zadumka.png` доступны как `bomjara1`, `Тёмный принц - Овердоз`
+//! и `Zadumka`. Один и тот же stem в двух каталогах даёт один мем: видео
+//! важнее аудио и фото, в остальных случаях побеждает первый найденный
+//! файл. Список читается один раз при старте: файлы меняются только
 //! пересборкой образа.
 
 use std::path::{Path, PathBuf};
@@ -46,12 +47,13 @@ pub struct Memes {
 }
 
 impl Memes {
-    /// Скан `video/`, затем `music/`. Порядок важен: при совпадении имени
-    /// видео из `video/` уже лежит в списке, а видео-дубль вытесняет аудио.
+    /// Скан `video/`, затем `music/`, затем `fotos/`. Порядок важен: при
+    /// совпадении имени видео из `video/` уже лежит в списке, а видео-дубль
+    /// вытесняет аудио; фото-дубль вытеснен кем угодно из первых двух.
     pub fn scan(root: &Path) -> Self {
         let mut items: Vec<Meme> = Vec::new();
 
-        for dir in ["video", "music"] {
+        for dir in ["video", "music", "fotos"] {
             let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
                 continue;
             };
@@ -261,6 +263,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("video")).unwrap();
         std::fs::create_dir_all(dir.join("music")).unwrap();
+        std::fs::create_dir_all(dir.join("fotos")).unwrap();
         dir
     }
 
@@ -405,5 +408,47 @@ mod tests {
         }
         assert_eq!(MemeKind::from_path(Path::new("a.txt")), None);
         assert_eq!(MemeKind::from_path(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn fotos_directory_joins_the_catalog() {
+        let root = temp_root("fotos");
+        std::fs::write(root.join("fotos/Zadumka.png"), b"p").unwrap();
+        std::fs::write(root.join("fotos/openvk.jpeg"), b"p").unwrap();
+        std::fs::write(root.join("fotos/notes.txt"), b"x").unwrap();
+
+        let memes = Memes::scan(&root);
+        let meme = memes
+            .find("zadumka")
+            .expect("фото из fotos/ должно попасть в список");
+        assert_eq!(meme.kind, MemeKind::Image, "png это фото");
+        assert!(meme.path.ends_with("fotos/Zadumka.png"), "{:?}", meme.path);
+        assert!(
+            memes.names().contains(&"openvk".to_string()),
+            "{:?}",
+            memes.names()
+        );
+        assert!(
+            !memes.names().contains(&"notes".to_string()),
+            "нечитаемый файл пропущен"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_photo_name_wins_in_meme_command() {
+        // find обязан предпочесть точное совпадение имени, а не подстраивать
+        // похожий файл: /meme Zadumka это именно это фото.
+        let root = temp_root("photo-name");
+        std::fs::write(root.join("fotos/Zadumka.png"), b"p").unwrap();
+        std::fs::write(root.join("fotos/Zadumka-2.png"), b"p").unwrap();
+
+        let memes = Memes::scan(&root);
+        let found = memes.find("Zadumka").expect("точное имя должно найтись");
+        assert_eq!(found.name, "Zadumka");
+        assert_eq!(found.kind, MemeKind::Image);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

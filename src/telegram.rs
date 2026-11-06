@@ -2,7 +2,8 @@
 //!
 //! Bot API не умеет входить в голосовые чаты, поэтому `/play` и `/stop` здесь
 //! только отвечают отказом. Остальное: команды с видеороликами, `/meme`,
-//! ключевые слова в группах и inline-режим по файлам из `video/` и `music/`.
+//! ключевые слова в группах и inline-режим по файлам из `video/`, `fotos/`
+//! и `music/`.
 //!
 //! Без `TELEGRAM_TOKEN` бот не запускается: для него больше нет другого
 //! транспорта. Сбой Telegram не паникует: диспетчер запускается в отдельной
@@ -47,6 +48,12 @@ pub const TELEGRAM_UPLOAD_LIMIT: u64 = 50 * 1024 * 1024;
 /// Сколько мемов прогревать по `TG_CACHE_CHAT`: 50 сообщений это предел
 /// разумной пачки на старте, остальные попадут в кэш первым `/meme`.
 const WARM_LIMIT: usize = 50;
+
+/// Шанс ответа на ключевое слово в чате. Файл существует и проверен до
+/// костей, но молчание в 55% случаев держит бота от ощущения спама.
+/// Промах костей не занимает слот лимита KEYWORD_RATE_LIMIT: следующее
+/// слово в чате может сработать сразу.
+const KEYWORD_REPLY_CHANCE: f64 = 0.45;
 
 type TgResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -165,7 +172,7 @@ fn telegram_commands() -> Vec<BotCommand> {
         BotCommand::new("batek", "белые розы"),
         BotCommand::new("timur", "ЗАЧЕМ Я ПОМЕНЯЛ ЕЕ НА ЭТО НА ЧЕРНОБЕЛОЕ"),
         BotCommand::new("victorovich", "В СТАРОМ ПАРКЕ ПАХНЕТ ХВОЙНОЙ ТИШИНОЙ"),
-        BotCommand::new("meme", "случайный мем из video/ или music/"),
+        BotCommand::new("meme", "случайный мем из video/, fotos/ или music/"),
         BotCommand::new("batekfetch", "ЭЭЭФЕТЧИ"),
         BotCommand::new("bomjara", "АКАКФИЛЬМНАНОУТБУКЕВКЛЮЧИТЬ"),
         BotCommand::new(
@@ -341,6 +348,13 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
             Some(meme)
         }
     };
+
+    // Кости до лимита: молчание не должно занимать слот 20 с, слот уходит
+    // только реальной отправке. Текст без файла (паста) по костям не играет.
+    if meme.is_some() && !rand::rng().random_bool(KEYWORD_REPLY_CHANCE) {
+        debug!("Telegram: ключевое слово '{phrase}': кости промолчали");
+        return;
+    }
 
     if !data.keywords.allow(chat.0, phrase).await {
         return;
@@ -551,7 +565,7 @@ async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgR
     }
 
     let mut text = if query.is_empty() {
-        "❌ Мемы не найдены. Положи файлы в video/ или music/.".to_string()
+        "❌ Мемы не найдены. Положи файлы в video/, fotos/ или music/.".to_string()
     } else {
         format!("❌ Мем '{query}' не найден.")
     };

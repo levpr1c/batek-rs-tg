@@ -28,6 +28,7 @@ WORKDIR /app
 RUN chown batek:batek /app
 COPY --from=builder /build/target/release/batek-rs-tg /usr/local/bin/batek-rs-tg
 COPY --chown=batek:batek music/ /app/music/
+COPY --chown=batek:batek fotos/ /app/fotos/
 COPY --chown=batek:batek video/ /app/video/
 
 ENV BATEK_ROOT=/app
