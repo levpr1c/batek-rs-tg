@@ -53,7 +53,7 @@ const WARM_LIMIT: usize = 50;
 /// костей, но молчание в 55% случаев держит бота от ощущения спама.
 /// Промах костей не занимает слот лимита KEYWORD_RATE_LIMIT: следующее
 /// слово в чате может сработать сразу.
-const KEYWORD_REPLY_CHANCE: f64 = 0.45;
+const KEYWORD_REPLY_CHANCE: f64 = 0.35;
 
 type TgResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
