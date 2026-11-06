@@ -268,11 +268,35 @@ async fn on_message(bot: Bot, msg: Message, me: Me, data: TgData) -> TgResult {
         return handle_command(&bot, &msg, &data, &command, &args).await;
     }
 
+    // Ответ на сообщение самого бота: короткая реакция, чтобы было видно, что
+    // бот заметил именно reply, а не просто слово в чате.
+    if is_reply_to_bot(&msg, me.id.0) {
+        bot.send_message(msg.chat.id, "аидитынахуй")
+            .reply_parameters(ReplyParameters::new(msg.id))
+            .await?;
+        return Ok(());
+    }
+
     if should_react_to_keyword(&msg, text, me.username()) {
         react_to_keyword(&bot, &msg, &data, text).await;
     }
 
     handle_mention(&bot, &msg, &data, me.username(), text).await
+}
+
+/// Реплай на сообщение бота. Отдельная функция, чтобы правило проверялось
+/// тестом без конструирования объектов Telegram.
+fn is_reply_to_bot(msg: &Message, bot_id: u64) -> bool {
+    is_reply_from(
+        msg.reply_to_message()
+            .and_then(|reply| reply.from.as_ref())
+            .map(|user| user.id.0),
+        bot_id,
+    )
+}
+
+fn is_reply_from(reply_author: Option<u64>, bot_id: u64) -> bool {
+    reply_author == Some(bot_id)
 }
 
 /// Реакция на ключевые слова только в группах и супергруппах, только на
@@ -1453,6 +1477,13 @@ mod tests {
         assert_eq!(parse_callback("v:42:z:s"), None);
         assert_eq!(parse_callback("v:42:t:s:extra"), None);
         assert_eq!(parse_callback("x:42:t:s"), None);
+    }
+
+    #[test]
+    fn reply_to_bot_is_detected_only_for_bot_author() {
+        assert!(is_reply_from(Some(42), 42));
+        assert!(!is_reply_from(Some(7), 42));
+        assert!(!is_reply_from(None, 42));
     }
 
     #[test]
