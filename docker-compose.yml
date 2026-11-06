@@ -11,6 +11,20 @@ services:
     # ufw на части машин режет исходящие из bridge-сети docker, а боту нужен
     # Telegram и YouTube. Портов у бота нет, поэтому сеть хоста безопасна.
     network_mode: host
+    # Процессу не нужны новые привилегии и Linux capabilities: он только
+    # читает медиа и говорит по сети.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+    # Боту хватает одного процесса и пары задач tokio; потолок PID не даёт
+    # yt-dlp размножиться при зависании.
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     env_file:
       - .env
     volumes:

@@ -13,9 +13,10 @@
 //! при следующем старте до готовности бота.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
+use rand::Rng as _;
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -50,13 +51,18 @@ pub const TABS: &[(&str, &str)] = &[
 ];
 
 const YTDLP_ARGS: &[&str] = &[
+    // Пользовательский конфиг yt-dlp может содержать чужие куки, прокси и
+    // пути вывода. Боту он не нужен, поэтому конфиг не читается вообще.
+    "--ignore-config",
     "--flat-playlist",
     "--quiet",
     "--no-warnings",
     "--skip-download",
 ];
 const TAB_TIMEOUT: Duration = Duration::from_secs(120);
-const REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Каналы меняются медленно: раз в двенадцать часов сеть дёргается реже,
+/// а кэш на диске переживает рестарт.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Потолок на вкладку: канал на 100k роликов не должен съедать память.
 const MAX_IDS_PER_TAB: usize = 5_000;
 
@@ -65,34 +71,63 @@ pub type Entries = HashMap<String, Vec<String>>;
 pub struct YoutubeCache {
     path: std::path::PathBuf,
     entries: RwLock<Entries>,
+    /// Время изменения файла на момент `load`. Фоновая задача сравнивает его
+    /// с интервалом обновления, чтобы не ходить в сеть сразу после старта,
+    /// если кэш уже свежий.
+    loaded_mtime: Option<SystemTime>,
 }
 
 impl YoutubeCache {
     pub async fn load(path: std::path::PathBuf) -> Self {
         let mut entries = Entries::new();
-        match tokio::fs::File::open(&path).await {
-            Ok(mut file) => {
-                let mut buf = String::new();
-                match file.read_to_string(&mut buf).await {
-                    Err(e) => warn!("кэш YouTube: не удалось прочитать {}: {e}", path.display()),
-                    Ok(_) => match serde_json::from_str::<Entries>(&buf) {
-                        Ok(map) => {
-                            entries = map;
-                            info!("кэш YouTube: загружено {} вкладок", entries.len());
-                        }
-                        Err(e) => warn!("кэш YouTube: некорректный JSON в {}: {e}", path.display()),
-                    },
-                }
+        let mut loaded_mtime = None;
+        let mut file_present = false;
+
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                file_present = true;
+                loaded_mtime = meta.modified().ok();
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => warn!("кэш YouTube: не удалось открыть {}: {e}", path.display()),
         }
+
+        if file_present {
+            match tokio::fs::File::open(&path).await {
+                Ok(mut file) => {
+                    let mut buf = String::new();
+                    match file.read_to_string(&mut buf).await {
+                        Err(e) => {
+                            warn!("кэш YouTube: не удалось прочитать {}: {e}", path.display())
+                        }
+                        Ok(_) => match serde_json::from_str::<Entries>(&buf) {
+                            Ok(map) => {
+                                // Файл мог быть испорчен вручную: в кэш
+                                // попадают только настоящие id, без дублей и
+                                // сверх потолка на вкладку.
+                                entries = sanitize_entries(map);
+                                info!("кэш YouTube: загружено {} вкладок", entries.len());
+                            }
+                            Err(e) => {
+                                warn!("кэш YouTube: некорректный JSON в {}: {e}", path.display())
+                            }
+                        },
+                    }
+                }
+                Err(e) => warn!("кэш YouTube: не удалось открыть {}: {e}", path.display()),
+            }
+        }
+
         Self {
             path,
             entries: RwLock::new(entries),
+            loaded_mtime,
         }
     }
 
+    /// Чтение одной вкладки целиком. Для случайной выдачи есть
+    /// `random_id_from`: он не копирует векторы.
+    #[allow(dead_code)]
     pub async fn get(&self, key: &str) -> Vec<String> {
         self.entries
             .read()
@@ -100,6 +135,33 @@ impl YoutubeCache {
             .get(key)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Один равновероятный id из объединения вкладок. Всё чтение идёт под
+    /// одной блокировкой, векторы не копируются: выбирается индекс, а
+    /// клонируется только победитель.
+    pub async fn random_id_from(&self, keys: &[&str]) -> Option<String> {
+        let entries = self.entries.read().await;
+        let total: usize = keys
+            .iter()
+            .filter_map(|key| entries.get(*key))
+            .map(Vec::len)
+            .sum();
+        if total == 0 {
+            return None;
+        }
+
+        let mut pick = rand::rng().random_range(0..total);
+        for key in keys {
+            let Some(ids) = entries.get(*key) else {
+                continue;
+            };
+            if pick < ids.len() {
+                return Some(ids[pick].clone());
+            }
+            pick -= ids.len();
+        }
+        None
     }
 
     /// Один проход по всем вкладкам. Никогда не паникует; упавшая вкладка
@@ -146,7 +208,9 @@ impl YoutubeCache {
     /// Атомарная запись: временный файл рядом, затем rename.
     async fn persist(&self) -> Result<(), std::io::Error> {
         let snapshot = self.entries.read().await.clone();
-        let json = serde_json::to_vec_pretty(&snapshot)?;
+        // Компактный JSON: файл читается только этим процессом, отступы
+        // здесь лишние байты на диск и время записи.
+        let json = serde_json::to_vec(&snapshot)?;
         let tmp = self.path.with_extension("json.tmp");
         tokio::fs::write(&tmp, json).await?;
         tokio::fs::rename(&tmp, &self.path).await
@@ -184,10 +248,18 @@ pub fn merge_refresh(
 }
 
 /// Фоновое обновление: первый проход после короткой паузы, чтобы старт
-/// бота наступил раньше сети, затем раз в шесть часов.
+/// бота наступил раньше сети, затем раз в двенадцать часов. Если файл кэша
+/// моложе интервала, стартовый проход откладывается: рестарт не должен
+/// каждый раз дёргать yt-dlp по шести вкладкам.
 pub fn spawn_refresh(cache: std::sync::Arc<YoutubeCache>) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(age) = cache.loaded_mtime.and_then(|at| at.elapsed().ok()) {
+            if age < REFRESH_INTERVAL {
+                info!("кэш YouTube: файл моложе {REFRESH_INTERVAL:?}, обновление отложено");
+                tokio::time::sleep(REFRESH_INTERVAL - age).await;
+            }
+        }
         loop {
             cache.refresh_once().await;
             tokio::time::sleep(REFRESH_INTERVAL).await;
@@ -195,15 +267,37 @@ pub fn spawn_refresh(cache: std::sync::Arc<YoutubeCache>) {
     });
 }
 
+/// Окружение для `yt-dlp`: процесс не должен видеть токен бота и прочие
+/// переменные. Оставляем только то, без чего не работает запуск сети,
+/// временных файлов и локали.
+fn ytdlp_env() -> [(&'static str, std::ffi::OsString); 4] {
+    fn or(key: &str, fallback: &str) -> std::ffi::OsString {
+        std::env::var_os(key).unwrap_or_else(|| std::ffi::OsString::from(fallback))
+    }
+    [
+        ("PATH", or("PATH", "/usr/local/bin:/usr/bin:/bin")),
+        ("HOME", or("HOME", "/tmp")),
+        ("LANG", or("LANG", "C.UTF-8")),
+        ("TMPDIR", or("TMPDIR", "/tmp")),
+    ]
+}
+
 async fn fetch_tab(url: &str) -> anyhow::Result<Vec<String>> {
-    let child = Command::new("yt-dlp")
+    let mut command = Command::new("yt-dlp");
+    command
         .args(YTDLP_ARGS)
         .args(["--print", "%(id)s"])
         .arg(url)
+        .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    for (key, value) in ytdlp_env() {
+        command.env(key, value);
+    }
+
+    let child = command
         .spawn()
         .with_context(|| format!("yt-dlp не запущен для {url}"))?;
 
@@ -220,6 +314,25 @@ async fn fetch_tab(url: &str) -> anyhow::Result<Vec<String>> {
     }
 
     Ok(parse_ids(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Проверка прочитанного с диска: только настоящие id, без дублей и не
+/// больше потолка на вкладку. Испорченный файл не должен раздувать память
+/// или отдавать в Telegram мусорные ссылки.
+fn sanitize_entries(entries: Entries) -> Entries {
+    entries
+        .into_iter()
+        .map(|(key, ids)| {
+            let mut seen = HashSet::new();
+            let ids = ids
+                .into_iter()
+                .filter(|id| is_video_id(id))
+                .filter(|id| seen.insert(id.clone()))
+                .take(MAX_IDS_PER_TAB)
+                .collect();
+            (key, ids)
+        })
+        .collect()
 }
 
 /// Разбор вывода `--print %(id)s`: дедупликация, отсев мусора и потолок.
@@ -267,6 +380,65 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(parse_ids(&stdout).len() <= MAX_IDS_PER_TAB);
+    }
+
+    #[test]
+    fn load_filters_invalid_duplicate_and_oversized_tabs() {
+        let mut raw = Entries::new();
+        raw.insert(
+            "batek:shorts".to_string(),
+            vec![
+                "dQw4w9WgXcQ".to_string(),
+                "dQw4w9WgXcQ".to_string(),
+                "not-an-id".to_string(),
+                "AAAAAAAAAAA".to_string(),
+                "слишком длинный id".to_string(),
+            ],
+        );
+        raw.insert(
+            "timur:videos".to_string(),
+            (0..MAX_IDS_PER_TAB + 50)
+                .map(|i| format!("{:011}", i % 10_000_000_000))
+                .collect(),
+        );
+
+        let clean = sanitize_entries(raw);
+
+        assert_eq!(
+            clean.get("batek:shorts"),
+            Some(&ids(&["dQw4w9WgXcQ", "AAAAAAAAAAA"]))
+        );
+        assert_eq!(
+            clean.get("timur:videos").map_or(0, Vec::len),
+            MAX_IDS_PER_TAB,
+            "потолок вкладки обязан действовать и на диск"
+        );
+    }
+
+    #[tokio::test]
+    async fn random_id_from_uses_all_keys_under_one_lock() {
+        let cache = YoutubeCache {
+            path: std::path::PathBuf::from("unused.json"),
+            entries: RwLock::new(entries(&[
+                ("batek:shorts", &["AAAAAAAAAAA"]),
+                ("timur:videos", &["dQw4w9WgXcQ"]),
+            ])),
+            loaded_mtime: None,
+        };
+
+        let mut seen = HashSet::new();
+        for _ in 0..200 {
+            let id = cache
+                .random_id_from(&["batek:shorts", "timur:videos"])
+                .await
+                .expect("id есть");
+            seen.insert(id);
+        }
+        assert_eq!(
+            seen,
+            HashSet::from(["AAAAAAAAAAA".to_string(), "dQw4w9WgXcQ".to_string()])
+        );
+        assert_eq!(cache.random_id_from(&["missing"]).await, None);
     }
 
     fn ids(values: &[&str]) -> Vec<String> {

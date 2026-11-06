@@ -4,6 +4,7 @@
 //! создана вместе с ботом и не переживает перезапуск.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rand::seq::SliceRandom;
@@ -231,6 +232,43 @@ pub enum KeywordAction {
     RandomMeme(&'static [&'static str]),
 }
 
+/// Одна строка таблицы, разобранная один раз за процесс.
+struct Entry {
+    /// Нормализованные слова фразы: по ним chat-матчер держит границы слов.
+    words: Vec<String>,
+    /// Склеенная нормализованная фраза: по ней inline-матчер ищет префикс.
+    key: String,
+    phrase: &'static str,
+    action: KeywordAction,
+}
+
+/// Индекс таблицы. Нормализация фраз не зависит от запроса, поэтому
+/// считается один раз, а не на каждое сообщение и не на каждый inline-запрос.
+fn index() -> &'static [Entry] {
+    static INDEX: OnceLock<Vec<Entry>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        KEYWORD_REACTIONS
+            .iter()
+            .map(|(phrase, action)| {
+                let words = normalized_words(phrase);
+                let key = words.concat();
+                Entry {
+                    words,
+                    key,
+                    phrase,
+                    action: *action,
+                }
+            })
+            .collect()
+    })
+}
+
+/// Прогревает индекс до первого сообщения: первый матч не платит за
+/// нормализацию всей таблицы.
+pub fn warm() {
+    let _ = index();
+}
+
 /// Ищет ключевую фразу по нормализованным словам: регистр, алфавит и
 /// дефисы не важны, но фраза должна занимать целые слова. Поэтому
 /// `небомжара` не совпадает, а `bomzhara` совпадает с `бомжара`.
@@ -240,15 +278,14 @@ pub fn match_keyword(text: &str) -> Option<(&'static str, KeywordAction)> {
         return None;
     }
 
-    KEYWORD_REACTIONS.iter().copied().find(|(phrase, _)| {
-        let needle = normalized_words(phrase);
-        if needle.is_empty() || needle.len() > words.len() {
-            return false;
+    index().iter().find_map(|entry| {
+        if entry.words.is_empty() || entry.words.len() > words.len() {
+            return None;
         }
-        let whole = needle.concat();
-        words
-            .windows(needle.len())
-            .any(|window| window.concat() == whole)
+        let hit = words
+            .windows(entry.words.len())
+            .any(|window| window == entry.words.as_slice());
+        hit.then_some((entry.phrase, entry.action))
     })
 }
 
@@ -268,40 +305,61 @@ pub fn match_keyword_prefix(query: &str) -> Option<(&'static str, KeywordAction)
     if needle.is_empty() {
         return None;
     }
+    let entries = index();
 
     // Точный нормализованный матч важнее префикса: "грандмобайл" обязан
     // прийти к одноимённой записи, а не через префикс.
-    if let Some(exact) = KEYWORD_REACTIONS
-        .iter()
-        .copied()
-        .find(|(phrase, _)| normalized_query(phrase) == needle)
-    {
-        return Some(exact);
+    if let Some(exact) = entries.iter().find(|entry| entry.key == needle) {
+        return Some((exact.phrase, exact.action));
     }
     if needle.chars().count() < 2 {
         return None;
     }
 
-    let mut best: Option<(usize, (&'static str, KeywordAction))> = None;
-    for entry in KEYWORD_REACTIONS.iter().copied() {
-        let normalized = normalized_query(entry.0);
-        if normalized.starts_with(&needle) {
-            let len = normalized.len();
-            if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
-                best = Some((len, entry));
-            }
+    let mut best: Option<&Entry> = None;
+    for entry in entries {
+        if entry.key.starts_with(&needle)
+            && best.is_none_or(|best| entry.key.len() > best.key.len())
+        {
+            best = Some(entry);
         }
     }
-    best.map(|(_, entry)| entry)
+    best.map(|entry| (entry.phrase, entry.action))
 }
 
 /// Совпадение иглы с мемом по нормализованным строкам в обе стороны:
 /// точный ключ или подстрока в любом направлении. «Серёжа» таблица
 /// держит одной иглой `serj`, и она обязана накрыть все его фото.
-fn needle_covers_name(name_key: &str, needle: &str) -> bool {
-    let needle_key = meme_key(needle);
+fn keys_cover(name_key: &str, needle_key: &str) -> bool {
     !(name_key.is_empty() || needle_key.is_empty())
-        && (name_key.contains(needle_key.as_str()) || needle_key.contains(name_key))
+        && (name_key.contains(needle_key) || needle_key.contains(name_key))
+}
+
+/// Строка таблицы с заранее посчитанными ключами игл. Нормализация целей
+/// действий не зависит от мема, поэтому живёт в `OnceLock`.
+struct PhraseEntry {
+    phrase: &'static str,
+    /// Пусто для `Grandmobile`: у текстовой реакции нет файла.
+    needles: Vec<String>,
+}
+
+fn phrase_index() -> &'static [PhraseEntry] {
+    static INDEX: OnceLock<Vec<PhraseEntry>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        KEYWORD_REACTIONS
+            .iter()
+            .map(|(phrase, action)| {
+                let needles = match action {
+                    KeywordAction::Grandmobile => Vec::new(),
+                    KeywordAction::Meme(needle) => vec![meme_key(needle)],
+                    KeywordAction::RandomMeme(needles) => {
+                        needles.iter().map(|needle| meme_key(needle)).collect()
+                    }
+                };
+                PhraseEntry { phrase, needles }
+            })
+            .collect()
+    })
 }
 
 /// Фразы таблицы, чей ключевой элемент указывает на этот мем. Meme(needle)
@@ -311,16 +369,13 @@ fn needle_covers_name(name_key: &str, needle: &str) -> bool {
 pub fn phrases_for_meme(meme: &Meme) -> Vec<&'static str> {
     let name_key = meme_key(&meme.name);
     let mut phrases: Vec<&'static str> = Vec::new();
-    for (phrase, action) in KEYWORD_REACTIONS.iter().copied() {
-        let hit = match action {
-            KeywordAction::Grandmobile => false,
-            KeywordAction::Meme(needle) => needle_covers_name(&name_key, needle),
-            KeywordAction::RandomMeme(needles) => needles
-                .iter()
-                .any(|needle| needle_covers_name(&name_key, needle)),
-        };
-        if hit && !phrases.contains(&phrase) {
-            phrases.push(phrase);
+    for entry in phrase_index() {
+        let hit = entry
+            .needles
+            .iter()
+            .any(|needle| keys_cover(&name_key, needle));
+        if hit && !phrases.contains(&entry.phrase) {
+            phrases.push(entry.phrase);
         }
     }
     phrases
@@ -331,8 +386,7 @@ pub fn phrases_for_meme(meme: &Meme) -> Vec<&'static str> {
 pub fn random_meme_candidates<'a>(memes: &'a Memes, needles: &[&str]) -> Vec<&'a Meme> {
     let needles: Vec<String> = needles.iter().map(|needle| meme_key(needle)).collect();
     let mut candidates: Vec<&Meme> = Vec::new();
-    for meme in memes.items() {
-        let key = meme_key(&meme.name);
+    for (meme, key) in memes.items().iter().zip(memes.keys()) {
         if needles.iter().any(|needle| key.contains(needle.as_str()))
             && !candidates.iter().any(|known| known.name == meme.name)
         {
@@ -349,31 +403,38 @@ pub fn pick_random_meme<'a>(candidates: &mut [&'a Meme]) -> Option<&'a Meme> {
     picked.first().copied()
 }
 
-/// Лимит ответов на ключевые слова. Ключ это id чата и сама фраза: лимиты
-/// чатов не смешиваются, а карта живёт вместе с процессом бота.
+/// Лимит ответов на ключевые слова. Ключ это только id чата: одно окно на
+/// чат, а не на фразу, поэтому разные слова в одной группе не обходят
+/// ограничение. Карта живёт вместе с процессом бота.
 #[derive(Default)]
 pub struct KeywordLimiter {
-    last: RwLock<HashMap<(i64, &'static str), Instant>>,
+    last: RwLock<HashMap<i64, Instant>>,
 }
+
+/// Потолок карты: после чистки старых записей она не должна расти дальше.
+const KEYWORD_MAP_LIMIT: usize = 10_000;
 
 impl KeywordLimiter {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Проверяет и обновляет лимит: не чаще одного ответа на фразу в чат за
-    /// `KEYWORD_RATE_LIMIT`. Попутно чистит старые записи.
-    pub async fn allow(&self, chat: i64, phrase: &'static str) -> bool {
+    /// Проверяет и обновляет лимит: не чаще одного ответа на любое ключевое
+    /// слово в чат за `KEYWORD_RATE_LIMIT`. Попутно чистит старые записи;
+    /// если и после чистки записей слишком много, карта очищается целиком.
+    pub async fn allow(&self, chat: i64) -> bool {
         let mut last = self.last.write().await;
         last.retain(|_, at| at.elapsed() < KEYWORD_PRUNE_AFTER);
+        if last.len() > KEYWORD_MAP_LIMIT {
+            last.clear();
+        }
 
-        let key = (chat, phrase);
-        if let Some(at) = last.get(&key) {
+        if let Some(at) = last.get(&chat) {
             if at.elapsed() < KEYWORD_RATE_LIMIT {
                 return false;
             }
         }
-        last.insert(key, Instant::now());
+        last.insert(chat, Instant::now());
         true
     }
 }
@@ -784,6 +845,102 @@ mod tests {
                 "inline и chat расходятся на {phrase}"
             );
         }
+    }
+
+    /// Старая построчная логика без OnceLock: эталон для проверки индекса.
+    fn naive_match_keyword(text: &str) -> Option<(&'static str, KeywordAction)> {
+        let words = normalized_words(text);
+        if words.is_empty() {
+            return None;
+        }
+        KEYWORD_REACTIONS.iter().copied().find(|(phrase, _)| {
+            let needle = normalized_words(phrase);
+            if needle.is_empty() || needle.len() > words.len() {
+                return false;
+            }
+            let whole = needle.concat();
+            words
+                .windows(needle.len())
+                .any(|window| window.concat() == whole)
+        })
+    }
+
+    #[test]
+    fn index_matches_naive_matcher() {
+        assert_eq!(index().len(), KEYWORD_REACTIONS.len());
+
+        let mut samples: Vec<String> = KEYWORD_REACTIONS
+            .iter()
+            .map(|(phrase, _)| (*phrase).to_string())
+            .collect();
+        samples.extend(
+            [
+                "",
+                "   ",
+                "небомжара",
+                "1320",
+                "скинь 320",
+                "просто текст",
+                "GRAND MOBILE",
+                "bomzhara!",
+                "отошёл",
+            ]
+            .iter()
+            .map(|text| (*text).to_string()),
+        );
+
+        for text in samples {
+            assert_eq!(
+                match_keyword(&text),
+                naive_match_keyword(&text),
+                "индекс разошёлся с эталоном на {text:?}"
+            );
+            assert_eq!(
+                match_keyword_prefix(&text),
+                naive_prefix_match(&text),
+                "inline-индекс разошёлся с эталоном на {text:?}"
+            );
+        }
+    }
+
+    /// Старый prefix-матчер для сравнения: точный ключ, затем самый длинный
+    /// префикс, при равенстве побеждает первая строка таблицы.
+    fn naive_prefix_match(query: &str) -> Option<(&'static str, KeywordAction)> {
+        let needle = normalized_query(query);
+        if needle.is_empty() {
+            return None;
+        }
+        if let Some(exact) = KEYWORD_REACTIONS
+            .iter()
+            .copied()
+            .find(|(phrase, _)| normalized_query(phrase) == needle)
+        {
+            return Some(exact);
+        }
+        if needle.chars().count() < 2 {
+            return None;
+        }
+        let mut best: Option<(usize, (&'static str, KeywordAction))> = None;
+        for entry in KEYWORD_REACTIONS.iter().copied() {
+            let normalized = normalized_query(entry.0);
+            if normalized.starts_with(&needle) {
+                let len = normalized.len();
+                if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
+                    best = Some((len, entry));
+                }
+            }
+        }
+        best.map(|(_, entry)| entry)
+    }
+
+    #[tokio::test]
+    async fn limiter_is_one_window_per_chat_not_per_phrase() {
+        let limiter = KeywordLimiter::new();
+        assert!(limiter.allow(1).await);
+        // Другая фраза в том же чате не обходит окно: ключ теперь только чат.
+        assert!(!limiter.allow(1).await);
+        // Другой чат живёт независимо.
+        assert!(limiter.allow(2).await);
     }
 
     fn plain_meme(name: &str) -> Meme {

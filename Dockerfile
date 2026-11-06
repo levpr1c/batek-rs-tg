@@ -16,9 +16,13 @@ RUN touch src/main.rs && cargo build --release
 
 FROM alpine:3.22
 ARG YTDLP_VERSION=2026.10.26
+# Контрольная сумма конкретного релиза: без неё подменённый бинарник на
+# GitHub или в зеркале попадёт в образ молча.
+ARG YTDLP_SHA256=e97a4dd919221d233e7720e18fa3f66db60fbd1d8c0846bf6deb8e88e04475a8
 RUN apk add --no-cache ca-certificates curl \
-    && curl -fsSL -o /usr/local/bin/yt-dlp \
+    && curl --proto '=https' --tlsv1.2 -fsSL -o /usr/local/bin/yt-dlp \
        "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp_musllinux" \
+    && echo "$YTDLP_SHA256  /usr/local/bin/yt-dlp" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/yt-dlp \
     && apk del curl \
     && addgroup -g 10001 batek \

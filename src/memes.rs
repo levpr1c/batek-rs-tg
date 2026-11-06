@@ -44,6 +44,9 @@ pub struct Meme {
 
 pub struct Memes {
     items: Vec<Meme>,
+    /// Ключи в том же порядке, что `items`: считаются один раз при скане,
+    /// чтобы поиск не транслитерировал имена на каждый запрос.
+    keys: Vec<String>,
 }
 
 impl Memes {
@@ -59,7 +62,12 @@ impl Memes {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_file() {
+                // `symlink_metadata` не идёт по ссылке: символическая ссылка
+                // может увести за пределы каталога и отдать чужой файл.
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if !meta.file_type().is_file() {
                     continue;
                 }
                 let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -86,7 +94,8 @@ impl Memes {
         }
 
         items.sort_by(|a, b| a.name.cmp(&b.name));
-        Self { items }
+        let keys = items.iter().map(|meme| meme_key(&meme.name)).collect();
+        Self { items, keys }
     }
 
     /// Сначала точное совпадение по нормализованному ключу, затем вхождение,
@@ -101,22 +110,21 @@ impl Memes {
         // Точный ключ важнее опечатки: запрос `бомжара` (ключ bomjara)
         // обязан выбрать bomjara1, а не похожий bomjaro2 с расстоянием 1.
         // Inline-выдача может показывать оба, но `find` выбирает один.
-        if let Some(exact) = self
-            .items
-            .iter()
-            .find(|meme| meme_key(&meme.name) == needle)
-        {
-            return Some(exact);
+        if let Some(index) = self.keys.iter().position(|key| *key == needle) {
+            return self.items.get(index);
         }
 
-        self.matches(query).into_iter().next()
+        self.matches_key(&needle).into_iter().next()
     }
 
     /// Ранжированные совпадения: точный ключ, вхождение (от трёх символов),
     /// затем ограниченное расстояние Левенштейна. Ранжирование нужно inline:
     /// `бомжара` должна показать `bomjara1` раньше `bomjaro2`.
     pub fn matches(&self, query: &str) -> Vec<&Meme> {
-        let needle = meme_key(query);
+        self.matches_key(&meme_key(query))
+    }
+
+    fn matches_key<'a>(&'a self, needle: &str) -> Vec<&'a Meme> {
         if needle.is_empty() {
             return Vec::new();
         }
@@ -127,13 +135,12 @@ impl Memes {
         let mut contains = Vec::new();
         let mut fuzzy = Vec::new();
 
-        for meme in &self.items {
-            let key = meme_key(&meme.name);
+        for (meme, key) in self.items.iter().zip(&self.keys) {
             if key == needle {
                 exact.push(meme);
-            } else if needle_len >= 3 && key.contains(&needle) {
+            } else if needle_len >= 3 && key.contains(needle) {
                 contains.push(meme);
-            } else if edit_distance_within(&key, &needle, limit) {
+            } else if edit_distance_within(key, needle, limit) {
                 fuzzy.push(meme);
             }
         }
@@ -153,6 +160,12 @@ impl Memes {
 
     pub fn items(&self) -> &[Meme] {
         &self.items
+    }
+
+    /// Предвычисленные ключи в порядке `items`: случайные группы сравнивают
+    /// имена без повторной нормализации.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
     }
 
     pub fn len(&self) -> usize {
@@ -448,6 +461,33 @@ mod tests {
         let found = memes.find("Zadumka").expect("точное имя должно найтись");
         assert_eq!(found.name, "Zadumka");
         assert_eq!(found.kind, MemeKind::Image);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_memes() {
+        let root = temp_root("symlink");
+        let target = root.join("outside");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("secret.png"), b"p").unwrap();
+        std::os::unix::fs::symlink(target.join("secret.png"), root.join("fotos/secret.png"))
+            .unwrap();
+        std::fs::write(root.join("fotos/real.png"), b"p").unwrap();
+
+        let memes = Memes::scan(&root);
+
+        assert!(
+            memes.names().contains(&"real".to_string()),
+            "{:?}",
+            memes.names()
+        );
+        assert!(
+            !memes.names().contains(&"secret".to_string()),
+            "символическая ссылка попала в каталог: {:?}",
+            memes.names()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

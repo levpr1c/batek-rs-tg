@@ -14,6 +14,8 @@ pub fn grandmobile_text() -> &'static str {
 }
 
 /// Данные для `/batekfetch`, снятые один раз в блокирующем потоке.
+/// `Clone` нужен кэшу на 15 секунд: отдаём снимок, не снимая систему заново.
+#[derive(Clone)]
 pub struct FetchInfo {
     pub os: String,
     pub host: String,
@@ -28,9 +30,14 @@ pub struct FetchInfo {
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 pub fn fetch_info() -> FetchInfo {
-    use sysinfo::{Disks, System};
+    use sysinfo::{CpuRefreshKind, Disks, System};
 
-    let sys = System::new_all();
+    // `new_all()` обновляет всё: процессы, сеть, диски. Для четырёх полей
+    // нужны только память и список CPU, а марка/имя хоста/uptime это
+    // статические ассоциативные функции.
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_list(CpuRefreshKind::nothing());
     let os = System::name()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Unknown OS".into());

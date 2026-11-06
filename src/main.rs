@@ -29,6 +29,10 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Индекс ключевых слов строится до первого сообщения: первый матч не
+    // должен платить за нормализацию всей таблицы.
+    keywords::warm();
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

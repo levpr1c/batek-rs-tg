@@ -19,8 +19,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use rand::seq::IndexedRandom;
@@ -41,9 +41,18 @@ use crate::memes::{meme_key, Meme, MemeKind, Memes};
 use crate::misc;
 use crate::youtube::YoutubeCache;
 
-/// Лимит Bot API на загрузку файла, байт. Файлы больше не отправляются:
-/// Telegram отклонит их целиком, поэтому отвечаем до чтения.
+/// Лимит Bot API на загрузку файла, байт. Видео и аудио можно отправлять
+/// до 50 МБ; фото Telegram принимает только до 10 МБ. Файлы больше не
+/// отправляются: Telegram отклонит их целиком, поэтому отвечаем до чтения.
 pub const TELEGRAM_UPLOAD_LIMIT: u64 = 50 * 1024 * 1024;
+pub const TELEGRAM_PHOTO_LIMIT: u64 = 10 * 1024 * 1024;
+
+/// Предел текста одного сообщения Telegram, символов.
+const TELEGRAM_MESSAGE_LIMIT: usize = 4096;
+
+/// Сколько секунд /batekfetch отдаёт тот же снимок системы. Серия вызовов
+/// не должна каждый раз поднимать spawn_blocking и читать /proc.
+const FETCH_CACHE_TTL: Duration = Duration::from_secs(15);
 
 /// Сколько мемов прогревать по `TG_CACHE_CHAT`: 50 сообщений это предел
 /// разумной пачки на старте, остальные попадут в кэш первым `/meme`.
@@ -70,9 +79,12 @@ pub struct TgData {
     /// Бронь на фоновую inline-догрузку по имени мема: повторный запрос
     /// не запускает вторую загрузку того же файла.
     pub inline_uploading: Arc<RwLock<HashSet<String>>>,
-    /// Лимиты ключевых слов этого процесса: не чаще одного ответа на фразу
-    /// в чат за KEYWORD_RATE_LIMIT.
+    /// Лимиты ключевых слов этого процесса: не чаще одного ответа на любое
+    /// слово в чат за KEYWORD_RATE_LIMIT.
     pub keywords: Arc<keywords::KeywordLimiter>,
+    /// Кэш /batekfetch: снимок живёт 15 секунд, чтобы серия команд не
+    /// дёргала sysinfo на каждый вызов.
+    pub fetch_cache: Arc<tokio::sync::Mutex<Option<(Instant, misc::FetchInfo)>>>,
     /// Прогрев выполняется один раз за процесс, а не на каждый перезапуск
     /// диспетчера после сетевой ошибки.
     warm_done: Arc<AtomicBool>,
@@ -111,6 +123,7 @@ impl TgData {
             file_ids: Arc::new(RwLock::new(HashMap::new())),
             inline_uploading: Arc::new(RwLock::new(HashSet::new())),
             keywords: Arc::new(keywords::KeywordLimiter::new()),
+            fetch_cache: Arc::new(tokio::sync::Mutex::new(None)),
             warm_done: Arc::new(AtomicBool::new(false)),
             debug_user_id: read_debug_user_id(),
         }
@@ -217,7 +230,9 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
         return;
     }
     let Ok(id) = raw.parse::<i64>() else {
-        warn!("Telegram: TG_CACHE_CHAT должен быть числовым id чата, получено {raw:?}");
+        // Само значение в журнал не попадает: это может быть чужая строка
+        // или почти токен. Достаточно сказать, что оно не число.
+        warn!("Telegram: TG_CACHE_CHAT не число, прогрев выключен");
         return;
     };
     if data.warm_done.swap(true, Ordering::SeqCst) {
@@ -249,6 +264,19 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
     }
 }
 
+/// Короткая метка для журнала: сообщение может быть длинным или содержать
+/// переводы строк. `{:?}` экранирует управляющие символы, а 120 символов
+/// хватает, чтобы понять текст, не раздувая журнал.
+fn truncate_for_log(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    // Многоточие входит в лимит: журнал не должен получать больше max.
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 async fn on_message(bot: Bot, msg: Message, me: Me, data: TgData) -> TgResult {
     let Some(text) = msg.text() else {
         return Ok(());
@@ -256,11 +284,12 @@ async fn on_message(bot: Bot, msg: Message, me: Me, data: TgData) -> TgResult {
 
     // Диагностика: видно, доходят ли сообщения вообще и что в них. Включается
     // через RUST_LOG=batek_rs_tg=debug.
+    let logged_text = truncate_for_log(text, 120);
     debug!(
         chat = msg.chat.id.0,
         chat_kind = ?msg.chat.kind,
         from_bot = msg.from.as_ref().is_some_and(|u| u.is_bot),
-        text = %text,
+        text = ?logged_text,
         "Telegram: входящее сообщение"
     );
 
@@ -355,17 +384,30 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
     };
     let chat = msg.chat.id;
 
-    // Файл проверяется до отправки: пропавший мем не должен превращаться
-    // в ответ об ошибке и не должен занимать окно лимита.
+    // Кости до лимита: молчание не должно занимать слот 20 с, слот уходит
+    // только реальной отправке. Текст без файла (паста) по костям не играет.
+    let is_media = !matches!(action, keywords::KeywordAction::Grandmobile);
+    if is_media && !rand::rng().random_bool(KEYWORD_REPLY_CHANCE) {
+        debug!("Telegram: ключевое слово '{phrase}': кости промолчали");
+        return;
+    }
+
+    // Один слот на чат: разные слова в одной группе не обходят окно.
+    if !data.keywords.allow(chat.0).await {
+        return;
+    }
+
+    // Файлы проверяются после лимита. Пропавший файл это не ошибка бота:
+    // он ожидаем при обновлении медиа и не должен шуметь в warn.
     let meme = match action {
         keywords::KeywordAction::Grandmobile => None,
         keywords::KeywordAction::Meme(needle) => {
             let Some(meme) = data.memes.find(needle) else {
-                warn!("Telegram: ключевое слово '{phrase}': мем '{needle}' не найден");
+                debug!("Telegram: ключевое слово '{phrase}': мем '{needle}' не найден");
                 return;
             };
             if tokio::fs::metadata(&meme.path).await.is_err() {
-                warn!(
+                debug!(
                     "Telegram: ключевое слово '{phrase}': файл мема '{}' не найден",
                     meme.name
                 );
@@ -380,30 +422,19 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
                 if tokio::fs::metadata(&meme.path).await.is_ok() {
                     existing.push(meme);
                 } else {
-                    warn!(
+                    debug!(
                         "Telegram: ключевое слово '{phrase}': файл мема '{}' не найден",
                         meme.name
                     );
                 }
             }
             let Some(meme) = keywords::pick_random_meme(&mut existing) else {
-                warn!("Telegram: ключевое слово '{phrase}': нет доступных мемов");
+                debug!("Telegram: ключевое слово '{phrase}': нет доступных мемов");
                 return;
             };
             Some(meme)
         }
     };
-
-    // Кости до лимита: молчание не должно занимать слот 20 с, слот уходит
-    // только реальной отправке. Текст без файла (паста) по костям не играет.
-    if meme.is_some() && !rand::rng().random_bool(KEYWORD_REPLY_CHANCE) {
-        debug!("Telegram: ключевое слово '{phrase}': кости промолчали");
-        return;
-    }
-
-    if !data.keywords.allow(chat.0, phrase).await {
-        return;
-    }
 
     match meme {
         Some(meme) => send_meme_logged(bot, chat, meme, data, Some(msg.id)).await,
@@ -489,7 +520,7 @@ async fn handle_command(
             triggers_command(bot, chat, data, args).await?;
         }
         "batekfetch" => {
-            let info = tokio::task::spawn_blocking(misc::fetch_info).await?;
+            let info = fetch_info_cached(data).await?;
             bot.send_message(chat, misc::format_fetch(&info)).await?;
         }
         "bomjara" => {
@@ -520,6 +551,22 @@ async fn handle_command(
     }
 
     Ok(())
+}
+
+/// Снимок системы для /batekfetch: 15 секунд отдаётся из кэша, затем
+/// снимается новый в блокирующем потоке. Блокировка держится и на время
+/// `spawn_blocking`, поэтому две одновременные команды не делают два снимка.
+async fn fetch_info_cached(data: &TgData) -> Result<misc::FetchInfo, tokio::task::JoinError> {
+    let mut cache = data.fetch_cache.lock().await;
+    if let Some((at, info)) = cache.as_ref() {
+        if at.elapsed() < FETCH_CACHE_TTL {
+            return Ok(info.clone());
+        }
+    }
+
+    let info = tokio::task::spawn_blocking(misc::fetch_info).await?;
+    *cache = Some((Instant::now(), info.clone()));
+    Ok(info)
 }
 
 /// Python: `randint(1, 100) > 10` отправлял кнопки, то есть ровно 10% на шутку.
@@ -605,9 +652,9 @@ async fn on_callback(bot: Bot, query: CallbackQuery, data: TgData) -> TgResult {
         's' => format!("{key}:shorts"),
         _ => format!("{key}:videos"),
     };
-    let ids = data.yt.get(&cache_key).await;
+    let id = data.yt.random_id_from(&[cache_key.as_str()]).await;
 
-    let text = match ids.choose(&mut rand::rng()) {
+    let text = match id {
         Some(id) if kind == 's' => format!("Вот твой шортс:\nhttps://youtu.be/{id}"),
         Some(id) => format!("Вот обычный видос:\nhttps://youtu.be/{id}"),
         None if kind == 's' => "Шортсов пока нет :(".to_string(),
@@ -616,6 +663,77 @@ async fn on_callback(bot: Bot, query: CallbackQuery, data: TgData) -> TgResult {
     bot.send_message(chat, text).await?;
 
     Ok(())
+}
+
+/// Максимальная длина метки запроса в ответе /meme: сырой запрос в чат не
+/// возвращается, а короткая метка не даёт раздуть сообщение.
+const MEME_QUERY_LABEL_MAX: usize = 64;
+
+/// Однострочная метка запроса: управляющие символы и переводы строк
+/// выбрасываются, пробелы схлопываются, длина ограничена.
+fn sanitize_label(query: &str) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    let mut pending_space = false;
+
+    for ch in query.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            if chars >= MEME_QUERY_LABEL_MAX {
+                break;
+            }
+            out.push(' ');
+            chars += 1;
+            pending_space = false;
+        }
+        if chars >= MEME_QUERY_LABEL_MAX {
+            break;
+        }
+        out.push(ch);
+        chars += 1;
+    }
+
+    out.trim_end().to_string()
+}
+
+/// Добавляет к тексту список доступных имён, не превышая лимит сообщения
+/// Telegram. Имена это локальные файлы, их длина не ограничена.
+fn append_available_names(text: String, names: &[String]) -> String {
+    const HEADER: &str = "\nДоступные: ";
+    if names.is_empty() {
+        return text;
+    }
+
+    let mut out = text;
+    out.push_str(HEADER);
+    let mut used = out.chars().count();
+    let mut added = 0usize;
+
+    for name in names.iter().take(10) {
+        let separator = if added == 0 { "" } else { ", " };
+        let needed = separator.chars().count() + name.chars().count();
+        // Четыре символа оставляем на ", ..." и возможный хвост.
+        if used + needed + 4 > TELEGRAM_MESSAGE_LIMIT {
+            break;
+        }
+        out.push_str(separator);
+        out.push_str(name);
+        used += needed;
+        added += 1;
+    }
+
+    if added == 0 {
+        // Ни одно имя не влезло: заголовок без списка хуже, чем его отсутствие.
+        out.truncate(out.len() - HEADER.len());
+        return out;
+    }
+    if names.len() > added {
+        out.push_str(", ...");
+    }
+    out
 }
 
 async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgResult {
@@ -630,28 +748,18 @@ async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgR
         return Ok(());
     }
 
-    let mut text = if query.is_empty() {
+    let text = if query.is_empty() {
         "❌ Мемы не найдены. Положи файлы в video/, fotos/ или music/.".to_string()
     } else {
-        format!("❌ Мем '{query}' не найден.")
+        let label = sanitize_label(query);
+        if label.is_empty() {
+            "❌ Мем не найден.".to_string()
+        } else {
+            format!("❌ Мем '{label}' не найден.")
+        }
     };
 
-    let names = data.memes.names();
-    if !names.is_empty() {
-        text.push_str("\nДоступные: ");
-        text.push_str(
-            &names
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        if names.len() > 10 {
-            text.push_str(", ...");
-        }
-    }
-
+    let text = append_available_names(text, &data.memes.names());
     bot.send_message(chat, text).await?;
     Ok(())
 }
@@ -766,6 +874,22 @@ async fn send_meme_logged(
     }
 }
 
+/// Предел загрузки для конкретного типа мема: фото Telegram принимает
+/// только до 10 МБ, видео и аудио до 50 МБ.
+fn upload_limit(kind: MemeKind) -> u64 {
+    match kind {
+        MemeKind::Image => TELEGRAM_PHOTO_LIMIT,
+        MemeKind::Video | MemeKind::Audio => TELEGRAM_UPLOAD_LIMIT,
+    }
+}
+
+fn upload_limit_text(kind: MemeKind) -> &'static str {
+    match kind {
+        MemeKind::Image => "❌ Файл больше 10 МБ, Telegram его не примет.",
+        MemeKind::Video | MemeKind::Audio => "❌ Файл больше 50 МБ, Telegram его не примет.",
+    }
+}
+
 async fn send_meme(
     bot: &Bot,
     chat: ChatId,
@@ -783,9 +907,8 @@ async fn send_meme(
         }
     };
 
-    if metadata.len() > TELEGRAM_UPLOAD_LIMIT {
-        bot.send_message(chat, "❌ Файл больше 50 МБ, Telegram его не примет.")
-            .await?;
+    if metadata.len() > upload_limit(meme.kind) {
+        bot.send_message(chat, upload_limit_text(meme.kind)).await?;
         return Ok(());
     }
 
@@ -946,13 +1069,17 @@ const INLINE_QUERY_COMMANDS: [(&str, InlineCommand); 11] = [
 /// `telegram_commands()`, по одной команде на строку. `/play` и `/stop`
 /// убраны: в Telegram они только отвечают отказом. Чистая функция, чтобы
 /// состав списка проверялся тестом.
-fn command_list_text() -> String {
-    telegram_commands()
-        .into_iter()
-        .filter(|command| command.command != "play" && command.command != "stop")
-        .map(|command| format!("/{} - {}", command.command, command.description))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn command_list_text() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| {
+        telegram_commands()
+            .into_iter()
+            .filter(|command| command.command != "play" && command.command != "stop")
+            .map(|command| format!("/{} - {}", command.command, command.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+    .as_str()
 }
 
 /// Inline-запрос считается префиксом имени команды без учёта регистра.
@@ -1047,13 +1174,15 @@ fn cached_meme_result_titled(
 }
 
 /// Случайный id из кэша перечисленных каналов. Пустой кэш даёт `None`:
-/// действие без ссылки в меню не попадает.
+/// действие без ссылки в меню не попадает. Один вызов `random_id_from`
+/// держит одну блокировку на все вкладки.
 async fn random_youtube_ids(data: &TgData, channels: &[&str], suffix: &str) -> Option<String> {
-    let mut ids = Vec::new();
-    for channel in channels {
-        ids.extend(data.yt.get(&format!("{channel}:{suffix}")).await);
-    }
-    ids.choose(&mut rand::rng()).cloned()
+    let keys: Vec<String> = channels
+        .iter()
+        .map(|channel| format!("{channel}:{suffix}"))
+        .collect();
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    data.yt.random_id_from(&refs).await
 }
 
 /// Случайный id по всем каналам: так устроено меню пустого запроса.
@@ -1073,7 +1202,7 @@ async fn upload_for_inline(bot: &Bot, user: ChatId, meme: Meme, data: &TgData) -
     // Проверка до отправки: send_meme на ошибке пишет сообщение в чат, а в
     // личном чате это был бы мусор от неудачного прогрева.
     match tokio::fs::metadata(&meme.path).await {
-        Ok(metadata) if metadata.len() <= TELEGRAM_UPLOAD_LIMIT => {}
+        Ok(metadata) if metadata.len() <= upload_limit(meme.kind) => {}
         Ok(_) => {
             debug!("Telegram: inline: файл {} больше лимита", meme.name);
             return None;
@@ -1221,6 +1350,21 @@ fn preparing_article() -> InlineQueryResult {
     )
 }
 
+/// Короткий стабильный id inline-результата. Сырое имя файла в id не
+/// нужно: Telegram требует уникальности в пределах ответа, а внутренние
+/// имена незачем отдавать клиенту.
+fn media_result_id(index: usize) -> String {
+    format!("m{index}")
+}
+
+/// Подсказка о фоновой загрузке не должна выбивать ответ за предел
+/// Telegram: если результаты уже заняли весь лимит, подсказка опускается.
+fn push_preparing(results: &mut Vec<InlineQueryResult>) {
+    if results.len() < INLINE_RESULT_LIMIT {
+        results.push(preparing_article());
+    }
+}
+
 async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
     let needle = query.query.trim().to_lowercase();
     let mut results: Vec<InlineQueryResult> = Vec::new();
@@ -1311,14 +1455,14 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                     &data,
                     &matched,
                     &mut results,
-                    |meme, _| meme.name.clone(),
+                    |_, len| media_result_id(len),
                     &mut *data.inline_uploading.write().await,
                 )
                 .await;
                 spawn_inline_uploads(&bot, user, queued, &data);
                 match readiness {
                     MemeReadiness::Cached => {}
-                    MemeReadiness::Preparing => results.push(preparing_article()),
+                    MemeReadiness::Preparing => push_preparing(&mut results),
                     MemeReadiness::NoMatch => {
                         results.push(article_result(
                             "media-cold",
@@ -1361,9 +1505,7 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
             Some(InlineCommand::Text(kind)) => {
                 let (title, text) = match kind {
                     InlineText::CommandList => ("Список команд", command_list_text()),
-                    InlineText::Grandmobile => {
-                        ("Гранд мобайл", misc::grandmobile_text().to_string())
-                    }
+                    InlineText::Grandmobile => ("Гранд мобайл", misc::grandmobile_text()),
                 };
                 results.push(article_result(
                     "command-text",
@@ -1420,7 +1562,11 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
 
                 match readiness {
                     MemeReadiness::Cached => {}
-                    MemeReadiness::Preparing => results.insert(0, preparing_article()),
+                    MemeReadiness::Preparing => {
+                        if results.len() < INLINE_RESULT_LIMIT {
+                            results.insert(0, preparing_article());
+                        }
+                    }
                     // Оставшийся без результатов текстом случай: ключ не
                     // совпал и по таблице, и по именам, либо совпавший
                     // мем вообще не лежит в каталоге.
@@ -1742,5 +1888,81 @@ mod tests {
         in_flight.remove("bomjara1");
         let retry = queue_pending_uploads(vec![inline_meme("bomjara1")], &mut in_flight);
         assert_eq!(retry.len(), 1);
+    }
+
+    #[test]
+    fn meme_query_label_is_single_line_short_and_escaped() {
+        assert_eq!(sanitize_label("  белые   розы \n"), "белые розы");
+        assert_eq!(sanitize_label("a\n\tb"), "a b");
+        assert_eq!(sanitize_label("\u{0}abc\u{7}"), "abc");
+        assert_eq!(sanitize_label(" \n\t "), "");
+        assert_eq!(sanitize_label(""), "");
+
+        let long = "ж".repeat(200);
+        let label = sanitize_label(&long);
+        assert_eq!(label.chars().count(), MEME_QUERY_LABEL_MAX);
+        assert!(!label.contains('\n'), "перевод строки не должен выжить");
+    }
+
+    #[test]
+    fn available_names_never_push_message_over_limit() {
+        let text = "❌ Мем не найден.".to_string();
+        let names: Vec<String> = (0..20)
+            .map(|i| format!("{i}-{}", "x".repeat(500)))
+            .collect();
+        let out = append_available_names(text, &names);
+        assert!(
+            out.chars().count() <= TELEGRAM_MESSAGE_LIMIT,
+            "{}",
+            out.chars().count()
+        );
+        assert!(out.contains("\nДоступные: "));
+
+        // Короткие имена перечисляются как раньше, с многоточием после десяти.
+        let short: Vec<String> = (0..12).map(|i| format!("name{i}")).collect();
+        let out = append_available_names("нет".to_string(), &short);
+        assert!(out.ends_with(", ..."), "{out}");
+    }
+
+    #[test]
+    fn upload_limit_is_ten_mib_for_photos() {
+        assert_eq!(upload_limit(MemeKind::Image), 10 * 1024 * 1024);
+        assert_eq!(upload_limit(MemeKind::Video), TELEGRAM_UPLOAD_LIMIT);
+        assert_eq!(upload_limit(MemeKind::Audio), TELEGRAM_UPLOAD_LIMIT);
+        assert!(upload_limit_text(MemeKind::Image).contains("10 МБ"));
+        assert!(upload_limit_text(MemeKind::Video).contains("50 МБ"));
+    }
+
+    #[test]
+    fn inline_ids_are_short_and_preparing_respects_cap() {
+        assert_eq!(media_result_id(0), "m0");
+        assert_eq!(media_result_id(49), "m49");
+
+        let mut results: Vec<InlineQueryResult> = (0..INLINE_RESULT_LIMIT)
+            .map(|index| article_result(media_result_id(index), "t", "d", "x"))
+            .collect();
+        push_preparing(&mut results);
+        assert_eq!(
+            results.len(),
+            INLINE_RESULT_LIMIT,
+            "ответ обязан остаться в лимите"
+        );
+
+        let mut almost: Vec<InlineQueryResult> = (0..INLINE_RESULT_LIMIT - 1)
+            .map(|index| article_result(media_result_id(index), "t", "d", "x"))
+            .collect();
+        push_preparing(&mut almost);
+        assert_eq!(almost.len(), INLINE_RESULT_LIMIT);
+    }
+
+    #[test]
+    fn debug_log_text_is_truncated() {
+        let short = "короткое сообщение";
+        assert_eq!(truncate_for_log(short, 120), short);
+
+        let long = "a".repeat(200);
+        let logged = truncate_for_log(&long, 120);
+        assert_eq!(logged.chars().count(), 120);
+        assert!(logged.ends_with('…'));
     }
 }
