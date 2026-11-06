@@ -1,6 +1,11 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # ufw на машине режет сеть из bridge-сборки, поэтому apk и curl идут
+      # через сеть хоста.
+      network: host
     container_name: batek_rs_tg
     restart: always
     # ufw на части машин режет исходящие из bridge-сети docker, а боту нужен
