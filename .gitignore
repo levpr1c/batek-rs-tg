@@ -1,0 +1,6 @@
+/target
+.env
+.env.*
+!.env.example
+yt_cache.json
+yt_cache.json.tmp

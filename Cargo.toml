@@ -1,0 +1,32 @@
+[package]
+name = "batek-rs-tg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teloxide = { version = "0.17", default-features = false, features = [
+    "rustls",
+    "macros",
+    "ctrlc_handler",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "signal",
+    "time",
+    "sync",
+    "fs",
+] }
+dotenvy = "0.15"
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+sysinfo = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# Символы в бинарнике не нужны, файл получается меньше.
+strip = true

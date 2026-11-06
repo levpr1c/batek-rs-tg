@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    container_name: batek_rs_tg
+    restart: always
+    # ufw на части машин режет исходящие из bridge-сети docker, а боту нужен
+    # Telegram и YouTube. Портов у бота нет, поэтому сеть хоста безопасна.
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      # Кэш YouTube и медиа из /app. При первом создании том наполняется
+      # образом, поэтому после обновления файлов том нужно пересоздать.
+      - batek_tg_data:/app
+
+volumes:
+  batek_tg_data:
