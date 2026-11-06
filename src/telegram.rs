@@ -30,7 +30,7 @@ use teloxide::types::{
     BotCommand, FileId, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
     InlineQueryResultArticle, InlineQueryResultCachedAudio, InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo, InputFile, InputMessageContent, InputMessageContentText, Me,
-    Message,
+    Message, MessageId, ReplyParameters,
 };
 use teloxide::update_listeners::polling_default;
 use tokio::sync::RwLock;
@@ -213,7 +213,7 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
     info!("Telegram: прогрев file_id в чате {id}, мемов: {total}");
 
     for (index, meme) in items.iter().take(WARM_LIMIT).enumerate() {
-        match send_meme(bot, chat, meme, data).await {
+        match send_meme(bot, chat, meme, data, None).await {
             Ok(()) => info!("Telegram: прогрев {}/{}: {}", index + 1, total, meme.name),
             Err(e) => warn!(
                 "Telegram: прогрев {}/{}: {} не отправлен: {e}",
@@ -361,9 +361,13 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
     }
 
     match meme {
-        Some(meme) => send_meme_logged(bot, chat, meme, data).await,
+        Some(meme) => send_meme_logged(bot, chat, meme, data, Some(msg.id)).await,
         None => {
-            if let Err(e) = bot.send_message(chat, misc::grandmobile_text()).await {
+            if let Err(e) = bot
+                .send_message(chat, misc::grandmobile_text())
+                .reply_parameters(ReplyParameters::new(msg.id))
+                .await
+            {
                 warn!("Telegram: ключевое слово '{phrase}': {e}");
             }
         }
@@ -560,7 +564,7 @@ async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgR
     } else {
         data.memes.find(query)
     } {
-        send_meme_logged(bot, chat, meme, data).await;
+        send_meme_logged(bot, chat, meme, data, None).await;
         return Ok(());
     }
 
@@ -613,14 +617,20 @@ async fn handle_mention(
     }
 
     match data.memes.find(remainder) {
-        Some(meme) => send_meme_logged(bot, msg.chat.id, meme, data).await,
+        Some(meme) => send_meme_logged(bot, msg.chat.id, meme, data, Some(msg.id)).await,
         None => debug!("Telegram: упоминание без мема: {remainder:?}"),
     }
     Ok(())
 }
 
-async fn send_meme_logged(bot: &Bot, chat: ChatId, meme: &Meme, data: &TgData) {
-    if let Err(e) = send_meme(bot, chat, meme, data).await {
+async fn send_meme_logged(
+    bot: &Bot,
+    chat: ChatId,
+    meme: &Meme,
+    data: &TgData,
+    reply_to: Option<MessageId>,
+) {
+    if let Err(e) = send_meme(bot, chat, meme, data, reply_to).await {
         error!("Telegram: мем {} не отправлен: {e}", meme.name);
         let _ = bot.send_message(chat, "❌ Не удалось отправить мем.").await;
     }
@@ -631,6 +641,7 @@ async fn send_meme(
     chat: ChatId,
     meme: &Meme,
     data: &TgData,
+    reply_to: Option<MessageId>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metadata = match tokio::fs::metadata(&meme.path).await {
         Ok(metadata) => metadata,
@@ -648,10 +659,27 @@ async fn send_meme(
     }
 
     let file = InputFile::file(&meme.path);
-    let message = match meme.kind {
-        MemeKind::Video => bot.send_video(chat, file).await?,
-        MemeKind::Image => bot.send_photo(chat, file).await?,
-        MemeKind::Audio => bot.send_audio(chat, file).await?,
+    // Ответ на сообщение с ключевым словом: у Telegram это reply_parameters,
+    // у команд и инлайна ответа на конкретное сообщение нет.
+    let message = match (meme.kind, reply_to) {
+        (MemeKind::Video, Some(id)) => {
+            bot.send_video(chat, file)
+                .reply_parameters(ReplyParameters::new(id))
+                .await?
+        }
+        (MemeKind::Video, None) => bot.send_video(chat, file).await?,
+        (MemeKind::Image, Some(id)) => {
+            bot.send_photo(chat, file)
+                .reply_parameters(ReplyParameters::new(id))
+                .await?
+        }
+        (MemeKind::Image, None) => bot.send_photo(chat, file).await?,
+        (MemeKind::Audio, Some(id)) => {
+            bot.send_audio(chat, file)
+                .reply_parameters(ReplyParameters::new(id))
+                .await?
+        }
+        (MemeKind::Audio, None) => bot.send_audio(chat, file).await?,
     };
 
     if let Some(file_id) = message_file_id(&message) {
