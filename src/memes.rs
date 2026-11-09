@@ -21,8 +21,9 @@ pub enum MemeKind {
 
 impl MemeKind {
     /// Расширение определяет способ отправки в Telegram. Неизвестные
-    /// расширения не мемы и в список не попадают.
-    fn from_path(path: &Path) -> Option<Self> {
+    /// расширения не мемы и в список не попадают. Функция открыта загрузке
+    /// из панели: она обязана принимать ровно те же расширения, что и скан.
+    pub fn from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "mp4" | "mov" | "webm" => Some(Self::Video),

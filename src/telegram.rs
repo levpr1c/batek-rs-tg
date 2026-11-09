@@ -36,7 +36,9 @@ use teloxide::update_listeners::polling_default;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::keywords;
+use crate::access::Access;
+use crate::admin;
+use crate::keywords::{self, KeywordStore, KeywordTable};
 use crate::memes::{meme_key, Meme, MemeKind, Memes};
 use crate::misc;
 use crate::youtube::YoutubeCache;
@@ -71,8 +73,20 @@ pub struct TgData {
     /// Токен хранится здесь, но никогда не логируется.
     pub token: String,
     pub yt: Arc<YoutubeCache>,
-    pub memes: Arc<Memes>,
+    /// Каталог мемов. Пересобирается после загрузки файла из панели, поэтому
+    /// здесь `RwLock<Arc<..>>`: читатели получают дешёвую копию снимка и не
+    /// держат блокировку через `await`.
+    pub memes: Arc<RwLock<Arc<Memes>>>,
     pub root: Arc<PathBuf>,
+    /// Таблица ключевых слов: встроенные фразы плюс правки из панели.
+    pub keywords: Arc<RwLock<KeywordTable>>,
+    /// Файл правок. Мутации под мьютексом: две правки не должны
+    /// перемешиваться в одну запись.
+    pub keyword_store: Arc<tokio::sync::Mutex<KeywordStore>>,
+    /// Права и одноразовые приглашения.
+    pub access: Arc<Access>,
+    /// Ожидание ввода и счётчик попыток для панели.
+    pub panels: Arc<admin::Panels>,
     /// file_id по имени мема. Заполняется только успешными отправками:
     /// угадать file_id нельзя, его выдаёт Telegram.
     pub file_ids: Arc<RwLock<HashMap<String, String>>>,
@@ -81,7 +95,7 @@ pub struct TgData {
     pub inline_uploading: Arc<RwLock<HashSet<String>>>,
     /// Лимиты ключевых слов этого процесса: не чаще одного ответа на любое
     /// слово в чат за KEYWORD_RATE_LIMIT.
-    pub keywords: Arc<keywords::KeywordLimiter>,
+    pub keyword_limiter: Arc<keywords::KeywordLimiter>,
     /// Кэш /batekfetch: снимок живёт 15 секунд, чтобы серия команд не
     /// дёргала sysinfo на каждый вызов.
     pub fetch_cache: Arc<tokio::sync::Mutex<Option<(Instant, misc::FetchInfo)>>>,
@@ -91,6 +105,14 @@ pub struct TgData {
     /// /triggers открыт только для этого пользователя. `None` означает
     /// выключенную отладку: переменная не задана или не число.
     pub debug_user_id: Option<i64>,
+}
+
+impl TgData {
+    /// Снимок каталога мемов. Копия `Arc` живёт без блокировки, поэтому
+    /// обработчик может ждать сеть, не мешая пересборке каталога.
+    pub async fn memes(&self) -> Arc<Memes> {
+        self.memes.read().await.clone()
+    }
 }
 
 /// Читает TG_DEBUG_USER_ID один раз при старте. Не задано или мусор это
@@ -114,15 +136,22 @@ impl TgData {
         yt: Arc<YoutubeCache>,
         memes: Arc<Memes>,
         root: Arc<PathBuf>,
+        access: Arc<Access>,
+        keyword_store: KeywordStore,
     ) -> Self {
+        let keywords = Arc::new(RwLock::new(keyword_store.table()));
         Self {
             token,
             yt,
-            memes,
+            memes: Arc::new(RwLock::new(memes)),
             root,
+            keywords,
+            keyword_store: Arc::new(tokio::sync::Mutex::new(keyword_store)),
+            access,
+            panels: Arc::new(admin::Panels::new()),
             file_ids: Arc::new(RwLock::new(HashMap::new())),
             inline_uploading: Arc::new(RwLock::new(HashSet::new())),
-            keywords: Arc::new(keywords::KeywordLimiter::new()),
+            keyword_limiter: Arc::new(keywords::KeywordLimiter::new()),
             fetch_cache: Arc::new(tokio::sync::Mutex::new(None)),
             warm_done: Arc::new(AtomicBool::new(false)),
             debug_user_id: read_debug_user_id(),
@@ -165,7 +194,7 @@ async fn run(data: TgData) -> anyhow::Result<()> {
     info!(
         "Telegram: бот @{} запущен, мемов: {}",
         me.username(),
-        data.memes.len()
+        data.memes().await.len()
     );
 
     if let Err(e) = bot.set_my_commands(telegram_commands()).await {
@@ -240,7 +269,8 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
     }
 
     let chat = ChatId(id);
-    let items = data.memes.items();
+    let memes = data.memes().await;
+    let items = memes.items();
     let total = items.len().min(WARM_LIMIT);
     if total == 0 {
         warn!("Telegram: прогревать нечего, мемов нет");
@@ -278,6 +308,13 @@ fn truncate_for_log(text: &str, max: usize) -> String {
 }
 
 async fn on_message(bot: Bot, msg: Message, me: Me, data: TgData) -> TgResult {
+    // Незаконченный ввод панели проверяется раньше текста: загрузка файла
+    // приходит сообщением без текста. Команда отменяет ожидание и проходит
+    // дальше обычным путём.
+    if admin::take_pending_message(&bot, &msg, &data).await {
+        return Ok(());
+    }
+
     let Some(text) = msg.text() else {
         return Ok(());
     };
@@ -379,8 +416,14 @@ fn contains_keyword(text: &str, phrase: &str) -> bool {
 }
 
 async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
-    let Some((phrase, action)) = keywords::match_keyword(text) else {
-        return;
+    // Таблица читается под блокировкой один раз на сообщение; дальше
+    // работаем с копией действия, чтобы не держать её через сеть.
+    let (phrase, action) = {
+        let table = data.keywords.read().await;
+        let Some((phrase, action)) = table.match_keyword(text) else {
+            return;
+        };
+        (phrase.to_string(), action)
     };
     let chat = msg.chat.id;
 
@@ -393,16 +436,17 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
     }
 
     // Один слот на чат: разные слова в одной группе не обходят окно.
-    if !data.keywords.allow(chat.0).await {
+    if !data.keyword_limiter.allow(chat.0).await {
         return;
     }
 
     // Файлы проверяются после лимита. Пропавший файл это не ошибка бота:
     // он ожидаем при обновлении медиа и не должен шуметь в warn.
+    let memes = data.memes().await;
     let meme = match action {
         keywords::KeywordAction::Grandmobile => None,
         keywords::KeywordAction::Meme(needle) => {
-            let Some(meme) = data.memes.find(needle) else {
+            let Some(meme) = memes.find(needle.as_ref()) else {
                 debug!("Telegram: ключевое слово '{phrase}': мем '{needle}' не найден");
                 return;
             };
@@ -416,7 +460,7 @@ async fn react_to_keyword(bot: &Bot, msg: &Message, data: &TgData, text: &str) {
             Some(meme)
         }
         keywords::KeywordAction::RandomMeme(needles) => {
-            let mut candidates = keywords::random_meme_candidates(&data.memes, needles);
+            let mut candidates = keywords::random_meme_candidates(&memes, needles);
             let mut existing = Vec::with_capacity(candidates.len());
             for meme in candidates.drain(..) {
                 if tokio::fs::metadata(&meme.path).await.is_ok() {
@@ -502,6 +546,12 @@ async fn handle_command(
         "timur" => video_choice(bot, msg, "t").await?,
         "victorovich" => video_choice(bot, msg, "v").await?,
         "meme" => meme_command(bot, chat, data, args).await?,
+        "admin" => admin::open(bot, msg, data).await?,
+        "cancel" => {
+            // Ожидание уже снято в on_message, ответ подтверждает действие.
+            bot.send_message(chat, "Ввод отменён.").await?;
+        }
+        "mod" => admin::redeem(bot, msg, data, args).await?,
         "triggers" | "words" => {
             let sender = msg.from.as_ref().map(|user| user.id.0 as i64);
             if !triggers_allowed(data.debug_user_id, sender) {
@@ -623,6 +673,13 @@ fn parse_callback(data: &str) -> Option<(u64, &'static str, char)> {
 }
 
 async fn on_callback(bot: Bot, query: CallbackQuery, data: TgData) -> TgResult {
+    // Нажатия панели идут своим путём: у них другая проверка прав и другая
+    // разметка ответа. Всё, что начинается с `ad:`, принадлежит панели.
+    if query.data.as_deref().is_some_and(admin::is_panel_callback) {
+        admin::on_callback(&bot, &query, &data).await;
+        return Ok(());
+    }
+
     let Some(payload) = query.data.as_deref() else {
         let _ = bot.answer_callback_query(query.id.clone()).await;
         return Ok(());
@@ -738,11 +795,12 @@ fn append_available_names(text: String, names: &[String]) -> String {
 
 async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgResult {
     let query = args.trim();
+    let memes = data.memes().await;
 
     if let Some(meme) = if query.is_empty() {
-        data.memes.random()
+        memes.random()
     } else {
-        data.memes.find(query)
+        memes.find(query)
     } {
         send_meme_logged(bot, chat, meme, data, None).await;
         return Ok(());
@@ -759,7 +817,7 @@ async fn meme_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgR
         }
     };
 
-    let text = append_available_names(text, &data.memes.names());
+    let text = append_available_names(text, &memes.names());
     bot.send_message(chat, text).await?;
     Ok(())
 }
@@ -782,12 +840,12 @@ fn triggers_allowed(debug_user_id: Option<i64>, sender: Option<i64>) -> bool {
 /// Мемы с хотя бы одной фразой в таблице триггеров. По умолчанию только
 /// фото: видео и аудио аудио длиннее, и пачка не должна раздуваться без
 /// явного запроса. Чистая функция без сети, проверяется тестом.
-fn trigger_list(memes: &Memes, all: bool) -> Vec<&Meme> {
+fn trigger_list<'a>(memes: &'a Memes, table: &KeywordTable, all: bool) -> Vec<&'a Meme> {
     memes
         .items()
         .iter()
         .filter(|meme| {
-            (all || meme.kind == MemeKind::Image) && !keywords::phrases_for_meme(meme).is_empty()
+            (all || meme.kind == MemeKind::Image) && !table.phrases_for_meme(meme).is_empty()
         })
         .collect()
 }
@@ -797,7 +855,16 @@ fn trigger_list(memes: &Memes, all: bool) -> Vec<&Meme> {
 /// видео и аудио вместо только фото.
 async fn triggers_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) -> TgResult {
     let all = matches!(args.trim().to_ascii_lowercase().as_str(), "все" | "all");
-    let list = trigger_list(&data.memes, all);
+    let memes = data.memes().await;
+    // Слова снимаются под блокировкой один раз, отправка идёт без неё:
+    // правка из панели не должна ждать пачку /triggers.
+    let list: Vec<(&Meme, String)> = {
+        let table = data.keywords.read().await;
+        trigger_list(&memes, &table, all)
+            .into_iter()
+            .map(|meme| (meme, table.phrases_for_meme(meme).join(", ")))
+            .collect()
+    };
 
     let header = if all {
         "Триггеры всех мемов:"
@@ -815,8 +882,7 @@ async fn triggers_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) ->
 
     bot.send_message(chat, header).await?;
 
-    for meme in list {
-        let phrases = keywords::phrases_for_meme(meme).join(", ");
+    for (meme, phrases) in list {
         let caption = format!("{}\nслова: {}", meme.name, phrases);
         // Пропавший файл не должен прерывать пачку: лог и следующая итерация.
         if tokio::fs::metadata(&meme.path).await.is_err() {
@@ -854,7 +920,8 @@ async fn handle_mention(
         return Ok(());
     }
 
-    match data.memes.find(remainder) {
+    let memes = data.memes().await;
+    match memes.find(remainder) {
         Some(meme) => send_meme_logged(bot, msg.chat.id, meme, data, Some(msg.id)).await,
         None => debug!("Telegram: упоминание без мема: {remainder:?}"),
     }
@@ -1368,6 +1435,7 @@ fn push_preparing(results: &mut Vec<InlineQueryResult>) {
 async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
     let needle = query.query.trim().to_lowercase();
     let mut results: Vec<InlineQueryResult> = Vec::new();
+    let memes = data.memes().await;
 
     if needle.is_empty() {
         results.push(article_result(
@@ -1395,8 +1463,7 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
         }
 
         let cache = data.file_ids.read().await;
-        let cached: Vec<(&Meme, &String)> = data
-            .memes
+        let cached: Vec<(&Meme, &String)> = memes
             .items()
             .iter()
             .filter_map(|meme| cache.get(&meme.name).map(|file_id| (meme, file_id)))
@@ -1444,7 +1511,7 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                 // файла подтянул бы `bomjara1` вторым результатом с тем же id.
                 let matched = needles
                     .iter()
-                    .filter_map(|needle| data.memes.find(needle))
+                    .filter_map(|needle| memes.find(needle))
                     .filter(|meme| {
                         needles
                             .iter()
@@ -1519,8 +1586,9 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
             // здесь так же, как в чатах. Совпадение по таблице исключает
             // обычный поиск по именам, чтобы не задваивать те же файлы.
             Some(InlineCommand::Meme) | None => {
-                let matched: Vec<&Meme> =
-                    if let Some((phrase, action)) = keywords::match_keyword_prefix(&needle) {
+                let matched: Vec<&Meme> = {
+                    let table = data.keywords.read().await;
+                    if let Some((phrase, action)) = table.match_keyword_prefix(&needle) {
                         debug!(
                             "Telegram: inline: '{}' по таблице '{}' ({phrase:?})",
                             needle, phrase
@@ -1536,19 +1604,20 @@ async fn on_inline(bot: Bot, query: InlineQuery, data: TgData) -> TgResult {
                                 Vec::new()
                             }
                             keywords::KeywordAction::Meme(meme_needle) => {
-                                data.memes.find(meme_needle).into_iter().collect()
+                                memes.find(meme_needle.as_ref()).into_iter().collect()
                             }
                             keywords::KeywordAction::RandomMeme(random_needles) => {
                                 // Все кандидаты отдельными результатами: и
                                 // bomjara1, и bomjaro2, а не один случайный.
                                 // Каталог уже отсортирован по имени, порядок
                                 // выдачи детерминированный.
-                                keywords::random_meme_candidates(&data.memes, random_needles)
+                                keywords::random_meme_candidates(&memes, random_needles)
                             }
                         }
                     } else {
-                        data.memes.matches(&needle)
-                    };
+                        memes.matches(&needle)
+                    }
+                };
 
                 let (readiness, queued) = serve_matched_memes(
                     &data,
@@ -1792,7 +1861,8 @@ mod tests {
         let memes = Memes::scan(&dir);
 
         // По умолчанию только фото, и только со словами в таблице.
-        let photos = trigger_list(&memes, false);
+        let table = keywords::KeywordTable::build(&keywords::KeywordEdits::default());
+        let photos = trigger_list(&memes, &table, false);
         assert_eq!(
             photos.len(),
             1,
@@ -1804,7 +1874,7 @@ mod tests {
 
         // Режим `все` не тянет мемы без триггеров: видео без фраз остаётся
         // за бортом, чтобы пачка не несла пустых сообщений.
-        let with_all = trigger_list(&memes, true);
+        let with_all = trigger_list(&memes, &table, true);
         assert_eq!(with_all.len(), 1);
         assert_eq!(with_all[0].name, "Zadumka");
 
