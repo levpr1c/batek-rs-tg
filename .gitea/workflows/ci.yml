@@ -1,0 +1,49 @@
+# Проверки на каждое изменение. Ровно те четыре команды, что записаны в
+# AGENTS.md: свои списки проверок в CI не дублируются, иначе они разойдутся.
+#
+# Ветка dev это интеграция, main только релизы. PR в main обязан пройти эти
+# же проверки: защита main без зелёного CI остаётся пожеланием.
+#
+# Checkout сделан обычным git, а не actions/checkout: это node-действие, а в
+# образе rust:1-bookworm node нет, и поставить его до checkout нельзя.
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - name: checkout
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        run: |
+          SCHEME="${GITHUB_SERVER_URL%%://*}"
+          HOST="${GITHUB_SERVER_URL#*://}"
+          AUTH="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\n')"
+          git init -q .
+          git config --local http.extraHeader "Authorization: Basic ${AUTH}"
+          git remote add origin "${SCHEME}://${HOST}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      # Компоненты не входят в базовый образ, а fmt и clippy нужны.
+      - name: rust components
+        run: rustup component add rustfmt clippy
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: release build
+        run: cargo build --release --locked

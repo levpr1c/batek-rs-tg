@@ -1,0 +1,115 @@
+# Релиз это тег vX.Y.Z на main, а не отдельная ветка и не отдельный
+# репозиторий. Тег запускает проверки, сборку образа и запись релиза в Gitea.
+#
+# Нужны секреты репозитория: REGISTRY_USER и REGISTRY_TOKEN с правом писать
+# пакеты. Необязательный REGISTRY задаёт хост реестра, если он отличается от
+# ROOT_URL Gitea.
+#
+# Checkout через git, не через actions/checkout: в rust и docker образах нет
+# node, а node-действие без него не стартует.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  gates:
+    # Тег ставится на уже проверенный main, но прогон повторяется: тег можно
+    # поставить и на старый коммит, а релиз не должен выйти из непроверенного.
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - name: checkout
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        run: |
+          SCHEME="${GITHUB_SERVER_URL%%://*}"
+          HOST="${GITHUB_SERVER_URL#*://}"
+          AUTH="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\n')"
+          git init -q .
+          git config --local http.extraHeader "Authorization: Basic ${AUTH}"
+          git remote add origin "${SCHEME}://${HOST}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      - name: rust components
+        run: rustup component add rustfmt clippy
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: release build
+        run: cargo build --release --locked
+
+  image:
+    needs: gates
+    # docker CLI без демона: сборка идёт через сокет хоста. В docker-режиме
+    # act_runner пробрасывает /var/run/docker.sock в контейнер задачи, иначе
+    # шаг сборки не увидит демон.
+    runs-on: ubuntu-latest
+    container: docker:27-cli
+    steps:
+      - name: tools
+        run: apk add --no-cache git curl
+
+      - name: checkout
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        run: |
+          SCHEME="${GITHUB_SERVER_URL%%://*}"
+          HOST="${GITHUB_SERVER_URL#*://}"
+          AUTH="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\n')"
+          git init -q .
+          git config --local http.extraHeader "Authorization: Basic ${AUTH}"
+          git remote add origin "${SCHEME}://${HOST}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+
+      # Хост реестра. По умолчанию берётся из ROOT_URL Gitea, то есть
+      # локальный адрес. Секрет REGISTRY переопределяет его, если образы
+      # должны тянуться снаружи, через gitea.2hollis.duckdns.org.
+      - name: registry host
+        run: |
+          HOST="${{ secrets.REGISTRY }}"
+          if [ -z "$HOST" ]; then
+            HOST="${GITHUB_SERVER_URL#*://}"
+          fi
+          echo "REGISTRY_HOST=$HOST" >> "$GITHUB_ENV"
+
+      - name: docker login
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$REGISTRY_HOST" \
+            --username "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: build and push
+        run: |
+          IMAGE="$REGISTRY_HOST/${{ github.repository }}"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          docker build \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            -t "$IMAGE:${GITHUB_REF_NAME}" \
+            -t "$IMAGE:sha-$SHA" \
+            -t "$IMAGE:latest" \
+            .
+          docker push "$IMAGE:${GITHUB_REF_NAME}"
+          docker push "$IMAGE:sha-$SHA"
+          docker push "$IMAGE:latest"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: gitea release
+        run: |
+          BODY="Образ: ${IMAGE}:${GITHUB_REF_NAME}; коммит: ${SHA}"
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Content-Type: application/json" \
+            "$GITHUB_SERVER_URL/api/v1/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"${GITHUB_REF_NAME}\",\"name\":\"${GITHUB_REF_NAME}\",\"body\":\"${BODY}\"}"

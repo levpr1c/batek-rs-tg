@@ -279,8 +279,8 @@ async fn warm_cache(bot: &Bot, data: &TgData) {
     info!("Telegram: прогрев file_id в чате {id}, мемов: {total}");
 
     for (index, meme) in items.iter().take(WARM_LIMIT).enumerate() {
-        match send_meme(bot, chat, meme, data, None, None).await {
-            Ok(()) => info!("Telegram: прогрев {}/{}: {}", index + 1, total, meme.name),
+        match send_meme(bot, chat, meme, data, None, None, None).await {
+            Ok(_) => info!("Telegram: прогрев {}/{}: {}", index + 1, total, meme.name),
             Err(e) => warn!(
                 "Telegram: прогрев {}/{}: {} не отправлен: {e}",
                 index + 1,
@@ -889,7 +889,7 @@ async fn triggers_command(bot: &Bot, chat: ChatId, data: &TgData, args: &str) ->
             warn!("Telegram: /triggers: файл мема '{}' не найден", meme.name);
             continue;
         }
-        if let Err(e) = send_meme(bot, chat, meme, data, None, Some(caption)).await {
+        if let Err(e) = send_meme(bot, chat, meme, data, None, Some(caption), None).await {
             warn!("Telegram: /triggers: мем {} не отправлен: {e}", meme.name);
         }
         tokio::time::sleep(TRIGGERS_GAP).await;
@@ -935,7 +935,7 @@ async fn send_meme_logged(
     data: &TgData,
     reply_to: Option<MessageId>,
 ) {
-    if let Err(e) = send_meme(bot, chat, meme, data, reply_to, None).await {
+    if let Err(e) = send_meme(bot, chat, meme, data, reply_to, None, None).await {
         error!("Telegram: мем {} не отправлен: {e}", meme.name);
         let _ = bot.send_message(chat, "❌ Не удалось отправить мем.").await;
     }
@@ -957,58 +957,72 @@ fn upload_limit_text(kind: MemeKind) -> &'static str {
     }
 }
 
-async fn send_meme(
+/// Отправляет мем и возвращает сообщение: панели нужен его id, чтобы
+/// перерисовать карточку с предпросмотром. `Ok(None)` значит, что файла нет
+/// или он больше предела: причина уже отправлена в чат.
+pub(crate) async fn send_meme(
     bot: &Bot,
     chat: ChatId,
     meme: &Meme,
     data: &TgData,
     reply_to: Option<MessageId>,
     caption: Option<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    markup: Option<InlineKeyboardMarkup>,
+) -> Result<Option<Message>, Box<dyn std::error::Error + Send + Sync>> {
     let metadata = match tokio::fs::metadata(&meme.path).await {
         Ok(metadata) => metadata,
         Err(_) => {
             bot.send_message(chat, format!("❌ Файл '{}' не найден.", meme.name))
                 .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
 
     if metadata.len() > upload_limit(meme.kind) {
         bot.send_message(chat, upload_limit_text(meme.kind)).await?;
-        return Ok(());
+        return Ok(None);
     }
 
     let file = InputFile::file(&meme.path);
     // Капция нужна /triggers: мем уходит с перечнем своих слов. Без
     // капции отправка неотличима от прежней; ответ на сообщение при
     // ключевой реакции держит reply_parameters.
+    let caption = caption.as_deref();
     let message = match meme.kind {
         MemeKind::Video => {
-            let sent = match caption {
-                Some(text) => bot.send_video(chat, file).caption(text),
-                None => bot.send_video(chat, file),
-            };
+            let mut sent = bot.send_video(chat, file);
+            if let Some(text) = caption {
+                sent = sent.caption(text);
+            }
+            if let Some(markup) = markup.clone() {
+                sent = sent.reply_markup(markup);
+            }
             match reply_to {
                 Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
                 None => sent.await?,
             }
         }
         MemeKind::Image => {
-            let sent = match caption {
-                Some(text) => bot.send_photo(chat, file).caption(text),
-                None => bot.send_photo(chat, file),
-            };
+            let mut sent = bot.send_photo(chat, file);
+            if let Some(text) = caption {
+                sent = sent.caption(text);
+            }
+            if let Some(markup) = markup.clone() {
+                sent = sent.reply_markup(markup);
+            }
             match reply_to {
                 Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
                 None => sent.await?,
             }
         }
         MemeKind::Audio => {
-            let sent = match caption {
-                Some(text) => bot.send_audio(chat, file).caption(text),
-                None => bot.send_audio(chat, file),
-            };
+            let mut sent = bot.send_audio(chat, file);
+            if let Some(text) = caption {
+                sent = sent.caption(text);
+            }
+            if let Some(markup) = markup {
+                sent = sent.reply_markup(markup);
+            }
             match reply_to {
                 Some(id) => sent.reply_parameters(ReplyParameters::new(id)).await?,
                 None => sent.await?,
@@ -1023,7 +1037,16 @@ async fn send_meme(
             .insert(meme.name.clone(), file_id);
     }
 
-    Ok(())
+    Ok(Some(message))
+}
+
+/// Можно ли показать мем в сообщении: файл есть и проходит предел отправки.
+/// Панель по этому решает, отправлять карточку с предпросмотром или текстом.
+pub(crate) async fn preview_ready(meme: &Meme) -> bool {
+    match tokio::fs::metadata(&meme.path).await {
+        Ok(metadata) => metadata.len() <= upload_limit(meme.kind),
+        Err(_) => false,
+    }
 }
 
 /// Telegram может вернуть видео документом (например webm), поэтому смотрим
