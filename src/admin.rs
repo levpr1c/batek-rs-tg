@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{FileId, InlineKeyboardButton, InlineKeyboardMarkup, Message, Recipient};
+use teloxide::types::{
+    FileId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId, Recipient,
+};
 use tracing::debug;
 
 use crate::access::{now_unix, Access, Capability, Role};
@@ -40,6 +42,10 @@ const DELETE_PER_ROW: usize = 5;
 
 /// Предел длины текста кнопки: длинные имена файлов ломают вёрстку клавиатуры.
 const BUTTON_NAME_MAX: usize = 28;
+
+/// Предел подписи к файлу в Telegram. Карточка уходит подписью, поэтому
+/// длинный список слов обрезается здесь, а не отклоняется Bot API.
+pub const CARD_CAPTION_LIMIT: usize = 1024;
 
 /// Ожидание ввода живёт пять минут: дольше админ забудет, что бот чего-то
 /// ждёт, и следующее сообщение в чат уйдёт не туда.
@@ -79,6 +85,9 @@ struct PendingEntry {
 pub struct Panels {
     pending: RwLock<HashMap<i64, PendingEntry>>,
     redeem: RwLock<HashMap<i64, (u32, Instant)>>,
+    /// Сообщение с открытой карточкой: после правки его нужно перерисовать,
+    /// а карточка с предпросмотром это файл, а не текст.
+    cards: RwLock<HashMap<i64, MessageId>>,
 }
 
 impl Panels {
@@ -120,6 +129,14 @@ impl Panels {
         if pending.get(&chat).is_some_and(|entry| entry.who == who) {
             pending.remove(&chat);
         }
+    }
+
+    pub fn remember_card(&self, chat: i64, message: MessageId) {
+        self.cards.write().unwrap().insert(chat, message);
+    }
+
+    pub fn card(&self, chat: i64) -> Option<MessageId> {
+        self.cards.read().unwrap().get(&chat).copied()
     }
 
     /// Разрешает попытку ввода кода. Окно скользящее: после истечения
@@ -355,6 +372,13 @@ pub async fn on_callback(bot: &Bot, query: &CallbackQuery, data: &TgData) -> boo
             .ok();
             return true;
         }
+        PanelAction::Card(index) => {
+            let _ = bot.answer_callback_query(query.id.clone()).await;
+            if let Err(e) = render_card(bot, chat, Some(message_id), data, index).await {
+                debug!("admin: карточка не отправлена: {e}");
+            }
+            return true;
+        }
         PanelAction::Delete(index, phrase_index) => {
             let phrase = {
                 let table = data.keywords.read().await;
@@ -386,6 +410,12 @@ pub async fn on_callback(bot: &Bot, query: &CallbackQuery, data: &TgData) -> boo
                         .await;
                 }
             }
+            // Карточка это файл, поэтому просто перерисовать текст нельзя:
+            // удаляем её и отправляем заново с актуальными словами.
+            if let Err(e) = render_card(bot, chat, Some(message_id), data, index).await {
+                debug!("admin: карточка не перерисована: {e}");
+            }
+            return true;
         }
         PanelAction::ModAdd => {
             data.panels.set(chat.0, user, Pending::AddModerator);
@@ -443,9 +473,20 @@ pub async fn on_callback(bot: &Bot, query: &CallbackQuery, data: &TgData) -> boo
         _ => {}
     }
 
-    // Остальные действия только перерисовывают текущее сообщение.
+    // Остальные действия перерисовывают текущее сообщение. Если оно было
+    // карточкой с файлом, текст поверх файла не поставить: удаляем и шлём
+    // новый экран.
+    let was_media = message.photo().is_some()
+        || message.video().is_some()
+        || message.audio().is_some()
+        || message.document().is_some();
     let (text, keyboard) = view(action, &data.access, role, data).await;
-    if bot
+    if was_media {
+        let _ = bot.delete_message(chat, message_id).await;
+        if let Ok(sent) = bot.send_message(chat, text).reply_markup(keyboard).await {
+            data.panels.remember_card(chat.0, sent.id);
+        }
+    } else if bot
         .edit_message_text(chat, message_id, text)
         .reply_markup(keyboard)
         .await
@@ -610,15 +651,14 @@ pub async fn handle_input(bot: &Bot, msg: &Message, data: &TgData, pending: Pend
                     return Ok(());
                 }
             }
-            // Сразу показываем карточку: видно, что фраза рядом с остальными.
+            // Сразу перерисовываем карточку: видно, что фраза рядом с
+            // остальными. Карточка с предпросмотром это файл, поэтому она
+            // отправляется заново, а старая удаляется.
             let memes = data.memes().await;
             if let Some(index) = memes.items().iter().position(|item| item.name == meme) {
-                let card = {
-                    let table = data.keywords.read().await;
-                    card_view(&memes, &table, index)
-                };
-                if let Some((text, keyboard)) = card {
-                    let _ = bot.send_message(chat, text).reply_markup(keyboard).await;
+                let old = data.panels.card(chat_id);
+                if let Err(e) = render_card(bot, chat, old, data, index).await {
+                    debug!("admin: карточка после добавления не отправлена: {e}");
                 }
             }
         }
@@ -988,38 +1028,45 @@ pub fn card_view(
     );
     if sources.is_empty() {
         text.push_str("\n\nСлов пока нет: добавь первое.");
-    } else {
-        text.push('\n');
-        for (position, (phrase, builtin, pending)) in
-            sources.iter().take(CARD_PHRASE_LIMIT).enumerate()
-        {
-            let mark = if *builtin {
-                "встроенное"
-            } else {
-                "добавленное"
-            };
-            let mark = if *pending {
-                format!("{mark}, ждёт пары")
-            } else {
-                mark.to_string()
-            };
-            text.push_str(&format!(
-                "\n{}. {} ({mark})",
-                position + 1,
-                display_name(phrase)
-            ));
+    }
+
+    // Показываем только те слова, которые влезли в подпись. Кнопки удаления
+    // строятся по тому же числу: иначе ✕12 удаляла бы слово, которого не
+    // видно, и админ нажимал бы вслепую.
+    let mut shown = 0usize;
+    for (position, (phrase, builtin, pending)) in sources.iter().enumerate() {
+        if position >= CARD_PHRASE_LIMIT {
+            break;
         }
-        if sources.len() > CARD_PHRASE_LIMIT {
-            text.push_str(&format!(
-                "\n... и ещё {}",
-                sources.len() - CARD_PHRASE_LIMIT
-            ));
+        let mark = if *builtin {
+            "встроенное"
+        } else {
+            "добавленное"
+        };
+        let mark = if *pending {
+            format!("{mark}, ждёт пары")
+        } else {
+            mark.to_string()
+        };
+        let line = format!("\n{}. {} ({mark})", position + 1, display_name(phrase));
+        // Запас на строку «ещё N» и на служебные символы.
+        if text.chars().count() + line.chars().count() + 32 > CARD_CAPTION_LIMIT {
+            break;
+        }
+        text.push_str(&line);
+        shown += 1;
+    }
+    if shown < sources.len() {
+        let hidden = sources.len() - shown;
+        let note = format!("\n... и ещё {hidden}");
+        if text.chars().count() + note.chars().count() <= CARD_CAPTION_LIMIT {
+            text.push_str(&note);
         }
     }
 
     let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let mut row: Vec<InlineKeyboardButton> = Vec::new();
-    for position in 0..sources.len().min(CARD_PHRASE_LIMIT) {
+    for position in 0..shown {
         row.push(InlineKeyboardButton::callback(
             format!("✕{}", position + 1),
             PanelAction::Delete(index, position).encode(),
@@ -1041,6 +1088,79 @@ pub fn card_view(
     )]);
 
     Some((text, InlineKeyboardMarkup::new(rows)))
+}
+
+/// Удаляет старый экран панели, если он был. Сообщение могли уже удалить
+/// руками, поэтому ошибка не мешает показать новый экран.
+async fn delete_old(bot: &Bot, chat: ChatId, old: Option<MessageId>) {
+    if let Some(old) = old {
+        let _ = bot.delete_message(chat, old).await;
+    }
+}
+
+/// Карточка мема отдельным сообщением: если файл проходит предел отправки,
+/// он уходит с подписью и кнопками, иначе карточка остаётся текстом. Старое
+/// сообщение панели удаляется, чтобы в чате не копились дубли.
+async fn render_card(
+    bot: &Bot,
+    chat: ChatId,
+    old: Option<MessageId>,
+    data: &TgData,
+    index: usize,
+) -> TgResult {
+    let memes = data.memes().await;
+    let card = {
+        let table = data.keywords.read().await;
+        card_view(&memes, &table, index)
+    };
+    let Some((caption, keyboard)) = card else {
+        let sent = bot
+            .send_message(
+                chat,
+                "Мем не найден: каталог изменился, открой список заново.",
+            )
+            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("К списку", PanelAction::List(0).encode()),
+            ]]))
+            .await?;
+        data.panels.remember_card(chat.0, sent.id);
+        delete_old(bot, chat, old).await;
+        return Ok(());
+    };
+
+    let meme = memes.items()[index].clone();
+    let sent = if crate::telegram::preview_ready(&meme).await {
+        crate::telegram::send_meme(
+            bot,
+            chat,
+            &meme,
+            data,
+            None,
+            Some(caption.clone()),
+            Some(keyboard.clone()),
+        )
+        .await
+    } else {
+        Ok(None)
+    };
+
+    match sent {
+        Ok(Some(message)) => {
+            delete_old(bot, chat, old).await;
+            data.panels.remember_card(chat.0, message.id);
+        }
+        // Файл не отправился: честно показываем текстовую карточку,
+        // а не оставляем админа без кнопок.
+        Ok(None) | Err(_) => {
+            delete_old(bot, chat, old).await;
+            let message = bot
+                .send_message(chat, caption)
+                .reply_markup(keyboard)
+                .await?;
+            data.panels.remember_card(chat.0, message.id);
+        }
+    }
+    Ok(())
 }
 
 fn mods_view(access: &Access, role: Role) -> (String, InlineKeyboardMarkup) {
@@ -1243,6 +1363,58 @@ mod tests {
             "нет кнопки добавления"
         );
         assert_eq!(card_view(&memes, &table, 999), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn card_caption_stays_within_telegram_limit() {
+        // Сорок добавленных фраз не влезают в подпись: карточка обязана
+        // обрезаться, а кнопки удаления обязаны совпадать с видимыми строками.
+        let mut added = Vec::new();
+        for index in 0..40 {
+            added.push(crate::keywords::AddedPhrase {
+                phrase: format!("слово{index}"),
+                meme: "baza".to_string(),
+            });
+        }
+        let table = KeywordTable::build(&crate::keywords::KeywordEdits {
+            added,
+            ..Default::default()
+        });
+
+        let root = temp_root("caption");
+        std::fs::write(root.join("fotos/baza.png"), b"p").unwrap();
+        let memes = Memes::scan(&root);
+        let index = memes
+            .items()
+            .iter()
+            .position(|meme| meme.name == "baza")
+            .unwrap();
+
+        let (text, keyboard) = card_view(&memes, &table, index).unwrap();
+        assert!(
+            text.chars().count() <= CARD_CAPTION_LIMIT,
+            "подпись {} символов",
+            text.chars().count()
+        );
+
+        let delete_buttons = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter(|button| button.text.starts_with('✕'))
+            .count();
+        let visible_lines = text
+            .lines()
+            .filter(|line| line.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+            .count();
+        assert_eq!(
+            delete_buttons, visible_lines,
+            "кнопок удаления {delete_buttons}, видимых строк {visible_lines}"
+        );
+        assert!(visible_lines > 0, "карточка пустая: {text}");
+        assert!(text.contains("ещё"), "нет пометки об обрезке: {text}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
