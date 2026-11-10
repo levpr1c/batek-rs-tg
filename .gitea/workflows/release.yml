@@ -1,0 +1,77 @@
+# Релиз это тег vX.Y.Z на main, а не отдельная ветка и не отдельный
+# репозиторий. Тег запускает проверки, сборку образа и запись релиза в Gitea.
+#
+# Нужны секреты репозитория: REGISTRY_USER и REGISTRY_TOKEN с правом писать
+# пакеты. Реестр берётся из адреса Gitea: REGISTRY_HOST вырезается из
+# GITHUB_SERVER_URL, поэтому отдельная переменная не нужна.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  gates:
+    # Тег ставится на уже проверенный main, но прогон повторяется: тег можно
+    # поставить и на старый коммит, а релиз не должен выйти из непроверенного.
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust components
+        run: rustup component add rustfmt clippy
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: release build
+        run: cargo build --release --locked
+
+  image:
+    needs: gates
+    # Этой джобе нужен docker на раннере: act_runner в docker-режиме
+    # получает /var/run/docker.sock. Без него сборка образа не запустится.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: registry host
+        run: echo "REGISTRY_HOST=${GITHUB_SERVER_URL#*://}" >> "$GITHUB_ENV"
+
+      - name: docker login
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$REGISTRY_HOST" \
+            --username "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      - name: build and push
+        run: |
+          IMAGE="$REGISTRY_HOST/${{ github.repository }}"
+          SHA="$(git rev-parse --short=7 HEAD)"
+          docker build \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            -t "$IMAGE:${GITHUB_REF_NAME}" \
+            -t "$IMAGE:sha-$SHA" \
+            -t "$IMAGE:latest" \
+            .
+          docker push "$IMAGE:${GITHUB_REF_NAME}"
+          docker push "$IMAGE:sha-$SHA"
+          docker push "$IMAGE:latest"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+
+      - name: gitea release
+        run: |
+          BODY="Образ: ${IMAGE}:${GITHUB_REF_NAME}; коммит: ${SHA}"
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Content-Type: application/json" \
+            "$GITHUB_SERVER_URL/api/v1/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"${GITHUB_REF_NAME}\",\"name\":\"${GITHUB_REF_NAME}\",\"body\":\"${BODY}\"}"

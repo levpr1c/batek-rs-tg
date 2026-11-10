@@ -1,0 +1,37 @@
+# Проверки на каждое изменение. Ровно те четыре команды, что записаны в
+# AGENTS.md: свои списки проверок в CI не дублируются, иначе они разойдутся.
+#
+# Ветка dev это интеграция, main только релизы. PR в main обязан пройти эти
+# же проверки: защита main без зелёного CI остаётся пожеланием.
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  gates:
+    # Раннер должен уметь rust:1-bookworm. Образ официальный, без своих
+    # пакетов: rustls не требует openssl, а gcc в образе уже есть.
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Компоненты не входят в базовый образ, а fmt и clippy нужны.
+      - name: rust components
+        run: rustup component add rustfmt clippy
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: release build
+        run: cargo build --release --locked

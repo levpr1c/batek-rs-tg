@@ -80,6 +80,46 @@
 поэтому бот откажет в добавлении одиночной фразы, если после неё у мема
 не останется пары алфавитов.
 
+## Ветки, CI и релизы
+
+`dev` это ветка разработки, `main` только релизы. Прямой push в `main`
+запрещён: изменения приходят merge из `dev` через PR, и merge без зелёного
+CI не делается.
+
+```bash
+git checkout dev        # работа идёт здесь
+git push -u origin dev  # первый раз создать ветку на сервере
+```
+
+Релиз это тег на `main`:
+
+```bash
+git checkout main
+git merge --no-ff dev
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin main --tags
+```
+
+Тег `v*` запускает `.gitea/workflows/release.yml`: повторяет четыре ворот из
+`AGENTS.md`, собирает образ, пушит его в реестр Gitea под тегом `v0.2.0` и
+`sha-<7>`, и создаёт релиз в Gitea. В деплое пин идёт на `sha-<7>`.
+
+Что нужно один раз настроить:
+
+1. Раннер Gitea Actions. Воротам хватает `rust:1-bookworm`, сборке образа
+   нужен docker: в docker-режиме `act_runner` монтирует
+   `/var/run/docker.sock`.
+2. Секреты репозитория `REGISTRY_USER` и `REGISTRY_TOKEN` с правом писать
+   пакеты.
+3. Защита ветки `main` в настройках Gitea: запрет force-push, обязательный
+   PR, обязательные проверки.
+4. Если у раннера нет доступа к github.com, в `app.ini` Gitea меняется
+   `DEFAULT_ACTIONS_URL` на зеркало, иначе `actions/checkout` не скачается.
+
+Реестр берётся из адреса Gitea: `REGISTRY_HOST` вырезается из
+`GITHUB_SERVER_URL`. Если реестр открыт по HTTP, docker на каждой ноде
+требует `insecure-registries`; надёжнее закрыть его TLS.
+
 ## Сборка и запуск
 
 ```bash
