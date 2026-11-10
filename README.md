@@ -106,15 +106,16 @@ git push origin main --tags
 
 Что нужно один раз настроить:
 
-1. Раннер Gitea Actions. Воротам хватает `rust:1-bookworm`, сборке образа
-   нужен docker: в docker-режиме `act_runner` монтирует
-   `/var/run/docker.sock`.
+1. Раннер Gitea Actions. Воротам нужен образ `rust:1-bookworm`, сборке
+   образа `docker:27-cli` и проброшенный `/var/run/docker.sock`: в
+   docker-режиме `act_runner` монтирует сокет в контейнер задачи.
 2. Секреты репозитория `REGISTRY_USER` и `REGISTRY_TOKEN` с правом писать
    пакеты.
 3. Защита ветки `main` в настройках Gitea: запрет force-push, обязательный
    PR, обязательные проверки.
-4. Если у раннера нет доступа к github.com, в `app.ini` Gitea меняется
-   `DEFAULT_ACTIONS_URL` на зеркало, иначе `actions/checkout` не скачается.
+4. Ничего дополнительно: workflows не тянут сторонние actions. Checkout
+   сделан обычным `git` с токеном `github.token`, поэтому node в образах
+   задач не нужен. Это же снимает зависимость от `DEFAULT_ACTIONS_URL`.
 
 Реестр берётся из `ROOT_URL` Gitea, то есть из того адреса, который Gitea
 считает своим. Сейчас это `http://192.168.0.120:3000`, значит образы

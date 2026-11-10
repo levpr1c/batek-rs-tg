@@ -2,8 +2,11 @@
 # репозиторий. Тег запускает проверки, сборку образа и запись релиза в Gitea.
 #
 # Нужны секреты репозитория: REGISTRY_USER и REGISTRY_TOKEN с правом писать
-# пакеты. Реестр берётся из адреса Gitea: REGISTRY_HOST вырезается из
-# GITHUB_SERVER_URL, поэтому отдельная переменная не нужна.
+# пакеты. Необязательный REGISTRY задаёт хост реестра, если он отличается от
+# ROOT_URL Gitea.
+#
+# Checkout через git, не через actions/checkout: в rust и docker образах нет
+# node, а node-действие без него не стартует.
 name: release
 
 on:
@@ -17,7 +20,18 @@ jobs:
     runs-on: ubuntu-latest
     container: rust:1-bookworm
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        run: |
+          SCHEME="${GITHUB_SERVER_URL%%://*}"
+          HOST="${GITHUB_SERVER_URL#*://}"
+          AUTH="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\n')"
+          git init -q .
+          git config --local http.extraHeader "Authorization: Basic ${AUTH}"
+          git remote add origin "${SCHEME}://${HOST}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
 
       - name: rust components
         run: rustup component add rustfmt clippy
@@ -36,11 +50,27 @@ jobs:
 
   image:
     needs: gates
-    # Этой джобе нужен docker на раннере: act_runner в docker-режиме
-    # получает /var/run/docker.sock. Без него сборка образа не запустится.
+    # docker CLI без демона: сборка идёт через сокет хоста. В docker-режиме
+    # act_runner пробрасывает /var/run/docker.sock в контейнер задачи, иначе
+    # шаг сборки не увидит демон.
     runs-on: ubuntu-latest
+    container: docker:27-cli
     steps:
-      - uses: actions/checkout@v4
+      - name: tools
+        run: apk add --no-cache git curl
+
+      - name: checkout
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        run: |
+          SCHEME="${GITHUB_SERVER_URL%%://*}"
+          HOST="${GITHUB_SERVER_URL#*://}"
+          AUTH="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 | tr -d '\n')"
+          git init -q .
+          git config --local http.extraHeader "Authorization: Basic ${AUTH}"
+          git remote add origin "${SCHEME}://${HOST}/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
 
       # Хост реестра. По умолчанию берётся из ROOT_URL Gitea, то есть
       # локальный адрес. Секрет REGISTRY переопределяет его, если образы
