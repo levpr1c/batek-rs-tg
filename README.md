@@ -117,8 +117,20 @@ git push origin main --tags
    `DEFAULT_ACTIONS_URL` на зеркало, иначе `actions/checkout` не скачается.
 
 Реестр берётся из адреса Gitea: `REGISTRY_HOST` вырезается из
-`GITHUB_SERVER_URL`. Если реестр открыт по HTTP, docker на каждой ноде
-требует `insecure-registries`; надёжнее закрыть его TLS.
+`GITHUB_SERVER_URL`. Сейчас Gitea отдаёт себя как `http://192.168.0.120:3000`,
+то есть реестр по HTTP. Docker на раннере и на будущих нодах должен знать
+этот адрес:
+
+```json
+{
+  "insecure-registries": ["192.168.0.120:3000"]
+}
+```
+
+Файл `/etc/docker/daemon.json`, затем перезапуск docker. Без этого `docker
+login` и `docker push` ответят `server gave HTTP response to HTTPS client`.
+Надёжнее один раз закрыть реестр TLS: тогда правка конфига на каждой ноде не
+нужна.
 
 ## Сборка и запуск
 
