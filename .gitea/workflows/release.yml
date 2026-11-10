@@ -42,8 +42,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Хост реестра. По умолчанию берётся из ROOT_URL Gitea, то есть
+      # локальный адрес. Секрет REGISTRY переопределяет его, если образы
+      # должны тянуться снаружи, через gitea.2hollis.duckdns.org.
       - name: registry host
-        run: echo "REGISTRY_HOST=${GITHUB_SERVER_URL#*://}" >> "$GITHUB_ENV"
+        run: |
+          HOST="${{ secrets.REGISTRY }}"
+          if [ -z "$HOST" ]; then
+            HOST="${GITHUB_SERVER_URL#*://}"
+          fi
+          echo "REGISTRY_HOST=$HOST" >> "$GITHUB_ENV"
 
       - name: docker login
         run: |
